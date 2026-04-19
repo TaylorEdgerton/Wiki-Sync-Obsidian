@@ -1,0 +1,28 @@
+PROFILE_NAME="Minimal"
+PROFILE_DESCRIPTION="General wiki workspace for a fresh project without sites, projects, or on-call operations."
+PROFILE_APPS=(
+    wiki
+    architecture
+    sources
+    activity
+)
+PROFILE_DIRS=(
+    wiki/concepts
+    wiki/entities
+    wiki/sources
+    wiki/comparisons
+    wiki/questions
+    wiki/canvases
+    wiki/meta
+    architecture/decisions
+    sources/raw
+    sources/ingested
+    sources/failed
+)
+PROFILE_ENABLE_ARCHITECTURE=1
+PROFILE_ENABLE_SITES=0
+PROFILE_ENABLE_RUNBOOKS=0
+PROFILE_ENABLE_PROJECTS=0
+PROFILE_ENABLE_ONCALL=0
+PROFILE_DOMAIN_ROOT=""
+PROFILE_DOMAIN_LABEL=""

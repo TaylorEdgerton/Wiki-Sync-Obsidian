@@ -1,0 +1,19 @@
+{
+  "name": "wiki-sync-plugin",
+  "private": true,
+  "description": "Local lint and syntax-check helpers for the Wiki Sync Obsidian plugin.",
+  "scripts": {
+    "build": "node build-release.mjs",
+    "check:syntax": "node --check main.js && node --check build-release.mjs",
+    "lint": "eslint *.js",
+    "lint:fix": "eslint --fix *.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.11",
+    "eslint": "^9.0.0"
+  }
+}

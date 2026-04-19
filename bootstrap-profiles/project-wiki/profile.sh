@@ -1,0 +1,34 @@
+PROFILE_NAME="Project Wiki"
+PROFILE_DESCRIPTION="Project documentation workspace with architecture, linked source material, and a simple issue lane."
+PROFILE_APPS=(
+    wiki
+    architecture
+    projects
+    sources
+    issues
+    activity
+)
+PROFILE_DIRS=(
+    wiki/concepts
+    wiki/entities
+    wiki/sources
+    wiki/comparisons
+    wiki/questions
+    wiki/canvases
+    wiki/meta
+    architecture/decisions
+    projects/_templates
+    sources/raw
+    sources/ingested
+    sources/failed
+    issues/active
+    issues/resolved
+    issues/postmortem
+)
+PROFILE_ENABLE_ARCHITECTURE=1
+PROFILE_ENABLE_SITES=0
+PROFILE_ENABLE_RUNBOOKS=0
+PROFILE_ENABLE_PROJECTS=1
+PROFILE_ENABLE_ONCALL=0
+PROFILE_DOMAIN_ROOT="issues"
+PROFILE_DOMAIN_LABEL="Issues"

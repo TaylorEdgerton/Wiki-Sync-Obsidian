@@ -1,0 +1,41 @@
+PROFILE_NAME="On-Call Operations"
+PROFILE_DESCRIPTION="Full operational workspace for live support, sites, projects, handover, and incident response."
+PROFILE_APPS=(
+    wiki
+    sites
+    runbooks
+    architecture
+    projects
+    sources
+    oncall
+    incidents
+    activity
+)
+PROFILE_DIRS=(
+    wiki/concepts
+    wiki/entities
+    wiki/sources
+    wiki/comparisons
+    wiki/questions
+    wiki/canvases
+    wiki/meta
+    sites/_templates
+    runbooks/templates
+    architecture/decisions
+    projects/_templates
+    sources/raw
+    sources/ingested
+    sources/failed
+    oncall/register
+    oncall/handover
+    incidents/active
+    incidents/resolved
+    incidents/postmortem
+)
+PROFILE_ENABLE_ARCHITECTURE=1
+PROFILE_ENABLE_SITES=1
+PROFILE_ENABLE_RUNBOOKS=1
+PROFILE_ENABLE_PROJECTS=1
+PROFILE_ENABLE_ONCALL=1
+PROFILE_DOMAIN_ROOT="incidents"
+PROFILE_DOMAIN_LABEL="Incidents"

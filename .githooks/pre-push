@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+WIKI_SYNC_DIR="${REPO_ROOT}/wiki-sync"
+MANIFEST_PATH="${WIKI_SYNC_DIR}/manifest.json"
+RELEASE_DIR="${WIKI_SYNC_DIR}/release/wiki-sync"
+REMOTE_NAME="${1:-origin}"
+
+if [[ ! -f "${MANIFEST_PATH}" ]]; then
+    exit 0
+fi
+
+REF_LINES="$(cat)"
+if [[ -z "${REF_LINES}" ]]; then
+    exit 0
+fi
+
+echo "[wiki-sync pre-push] Building release bundle..."
+(cd "${WIKI_SYNC_DIR}" && npm run build)
+
+if [[ -n "$(git status --porcelain --untracked-files=normal -- . ':(exclude)wiki-sync/release')" ]]; then
+    echo "[wiki-sync pre-push] Working tree has uncommitted changes outside wiki-sync/release; skipping release prompt."
+    echo "[wiki-sync pre-push] Commit or stash changes, then push again to publish a release."
+    exit 0
+fi
+
+VERSION="$(node -e "const fs=require('fs');const manifest=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(String(manifest.version||''));" "${MANIFEST_PATH}")"
+if [[ -z "${VERSION}" ]]; then
+    echo "[wiki-sync pre-push] Could not read version from wiki-sync/manifest.json; skipping release prompt."
+    exit 0
+fi
+
+TAG="v${VERSION}"
+
+if git ls-remote --exit-code --tags "${REMOTE_NAME}" "refs/tags/${TAG}" >/dev/null 2>&1; then
+    echo "[wiki-sync pre-push] ${TAG} already exists on ${REMOTE_NAME}; skipping release prompt."
+    exit 0
+fi
+
+if ! { exec 3</dev/tty 4>/dev/tty; } 2>/dev/null; then
+    echo "[wiki-sync pre-push] No interactive terminal available; skipping release prompt."
+    exit 0
+fi
+
+printf "[wiki-sync pre-push] Create and push tag %s and publish a GitHub release? [y/N] " "${TAG}" >&4
+read -r reply <&3 || reply=""
+exec 3<&- 4>&-
+case "${reply}" in
+    [Yy]|[Yy][Ee][Ss])
+        ;;
+    *)
+        echo "[wiki-sync pre-push] Continuing without tag/release."
+        exit 0
+        ;;
+esac
+
+if ! git show-ref --verify --quiet "refs/tags/${TAG}"; then
+    git tag -a "${TAG}" -m "Wiki Sync ${TAG}"
+fi
+
+ARCHIVE_PATH="${WIKI_SYNC_DIR}/release/wiki-sync-${TAG}.zip"
+node "${REPO_ROOT}/scripts/create-release-archive.mjs" "${RELEASE_DIR}" "${ARCHIVE_PATH}"
+
+echo "[wiki-sync pre-push] Pushing tag ${TAG}..."
+git push --no-verify "${REMOTE_NAME}" "refs/tags/${TAG}:refs/tags/${TAG}"
+
+if command -v gh >/dev/null 2>&1; then
+    echo "[wiki-sync pre-push] Publishing GitHub release ${TAG}..."
+    (
+        cd "${REPO_ROOT}"
+        gh release create "${TAG}" "${ARCHIVE_PATH}" \
+            --title "Wiki Sync ${TAG}" \
+            --generate-notes
+    ) || echo "[wiki-sync pre-push] GitHub release creation failed. Branch push will continue."
+else
+    echo "[wiki-sync pre-push] gh CLI is not installed; tag was pushed but GitHub release was skipped."
+fi
+
+exit 0

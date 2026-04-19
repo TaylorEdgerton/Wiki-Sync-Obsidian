@@ -1,0 +1,9 @@
+{
+  "id": "wiki-sync",
+  "name": "Wiki Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Sync a PostgreSQL-backed wiki into an Obsidian vault using OIDC or direct PostgreSQL auth.",
+  "author": "Taylor Edgerton",
+  "isDesktopOnly": true
+}

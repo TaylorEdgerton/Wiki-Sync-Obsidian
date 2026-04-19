@@ -1,0 +1,21 @@
+# Local environment
+.env
+.env.*
+
+# Node dependencies
+wiki-sync/node_modules/
+wiki-sync/release/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Logs and local caches
+*.log
+.eslintcache
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

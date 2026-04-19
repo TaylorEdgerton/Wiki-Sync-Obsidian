@@ -1,0 +1,38 @@
+PROFILE_NAME="Multi-Site Operations"
+PROFILE_DESCRIPTION="Operational workspace for multiple customer or site environments with shared runbooks, projects, and issue tracking."
+PROFILE_APPS=(
+    wiki
+    sites
+    runbooks
+    architecture
+    projects
+    sources
+    issues
+    activity
+)
+PROFILE_DIRS=(
+    wiki/concepts
+    wiki/entities
+    wiki/sources
+    wiki/comparisons
+    wiki/questions
+    wiki/canvases
+    wiki/meta
+    sites/_templates
+    runbooks/templates
+    architecture/decisions
+    projects/_templates
+    sources/raw
+    sources/ingested
+    sources/failed
+    issues/active
+    issues/resolved
+    issues/postmortem
+)
+PROFILE_ENABLE_ARCHITECTURE=1
+PROFILE_ENABLE_SITES=1
+PROFILE_ENABLE_RUNBOOKS=1
+PROFILE_ENABLE_PROJECTS=1
+PROFILE_ENABLE_ONCALL=0
+PROFILE_DOMAIN_ROOT="issues"
+PROFILE_DOMAIN_LABEL="Issues"
