@@ -11,6 +11,14 @@ The plugin supports two authentication paths:
 - `oidc`: browser-based PKCE login against an OIDC provider, then JWT-backed access through `pg-oidc-proxy.py`
 - `local`: direct PostgreSQL connection details for local development or trusted environments, with the database password stored through Obsidian SecretStorage
 
+## Screenshots
+<img src="screenshots/image.png" alt="Settings" width="600">
+<img src="screenshots/image-1.png" alt="Directory right click menu" width="400">
+<img src="screenshots/image-2.png" alt="Synced folder" width="400">
+<img src="screenshots/image-3.png" alt="Status menu items" width="400">
+<img src="screenshots/image-4.png" alt="Sync status" width="400">
+<img src="screenshots/image-5.png" alt="Sync right click menu" width="400">
+
 ## Requirements
 
 - Obsidian Desktop `1.11.4` or newer
