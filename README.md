@@ -12,12 +12,15 @@ The plugin supports two authentication paths:
 - `local`: direct PostgreSQL connection details for local development or trusted environments, with the database password stored through Obsidian SecretStorage
 
 ## Screenshots
-<img src="screenshots/image.png" alt="Settings" width="600">
-<img src="screenshots/image-1.png" alt="Directory right click menu" width="400">
-<img src="screenshots/image-2.png" alt="Synced folder" width="400">
-<img src="screenshots/image-3.png" alt="Status menu items" width="400">
-<img src="screenshots/image-4.png" alt="Sync status" width="400">
-<img src="screenshots/image-5.png" alt="Sync right click menu" width="400">
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 20px;">
+	<img src="screenshots/image.png" alt="Settings" width="600">
+	<img src="screenshots/image-1.png" alt="Directory right click menu" width="400">
+	<img src="screenshots/image-2.png" alt="Synced folder" width="400" >
+	<img src="screenshots/image-3.png" alt="Status menu items" width="400">
+	<img src="screenshots/image-4.png" alt="Sync status" width="400">
+	<img src="screenshots/image-5.png" alt="Sync right click menu">
+	<img src="screenshots/image-6.png" alt="History modal" width="800">
+</div>
 
 ## Requirements
 
