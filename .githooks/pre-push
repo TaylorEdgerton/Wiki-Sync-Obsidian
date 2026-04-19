@@ -33,9 +33,28 @@ fi
 
 TAG="v${VERSION}"
 
+REMOTE_TAG_EXISTS=false
 if git ls-remote --exit-code --tags "${REMOTE_NAME}" "refs/tags/${TAG}" >/dev/null 2>&1; then
-    echo "[wiki-sync pre-push] ${TAG} already exists on ${REMOTE_NAME}; skipping release prompt."
-    exit 0
+    REMOTE_TAG_EXISTS=true
+    HEAD_COMMIT="$(git rev-parse HEAD)"
+    TAG_COMMIT="$(git rev-parse "${TAG}^{commit}" 2>/dev/null || true)"
+    if [[ -n "${TAG_COMMIT}" && "${TAG_COMMIT}" != "${HEAD_COMMIT}" ]]; then
+        echo "[wiki-sync pre-push] ${TAG} already exists but points to ${TAG_COMMIT:0:12}; current HEAD is ${HEAD_COMMIT:0:12}."
+        echo "[wiki-sync pre-push] Skipping release prompt to avoid publishing an asset built from the wrong commit."
+        echo "[wiki-sync pre-push] Check out ${TAG} to publish that release, or bump wiki-sync/manifest.json for a new release."
+        exit 0
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "[wiki-sync pre-push] ${TAG} already exists on ${REMOTE_NAME}; gh CLI is not installed, so release publishing is skipped."
+        exit 0
+    fi
+    if (
+        cd "${REPO_ROOT}"
+        gh release view "${TAG}" >/dev/null 2>&1
+    ); then
+        echo "[wiki-sync pre-push] ${TAG} already exists on ${REMOTE_NAME} and has a GitHub release; skipping release prompt."
+        exit 0
+    fi
 fi
 
 if ! { exec 3</dev/tty 4>/dev/tty; } 2>/dev/null; then
@@ -43,7 +62,11 @@ if ! { exec 3</dev/tty 4>/dev/tty; } 2>/dev/null; then
     exit 0
 fi
 
-printf "[wiki-sync pre-push] Create and push tag %s and publish a GitHub release? [y/N] " "${TAG}" >&4
+if [[ "${REMOTE_TAG_EXISTS}" == true ]]; then
+    printf "[wiki-sync pre-push] Tag %s already exists but no GitHub release was found. Publish the release now? [y/N] " "${TAG}" >&4
+else
+    printf "[wiki-sync pre-push] Create and push tag %s and publish a GitHub release? [y/N] " "${TAG}" >&4
+fi
 read -r reply <&3 || reply=""
 exec 3<&- 4>&-
 case "${reply}" in
@@ -55,22 +78,26 @@ case "${reply}" in
         ;;
 esac
 
-if ! git show-ref --verify --quiet "refs/tags/${TAG}"; then
+if [[ "${REMOTE_TAG_EXISTS}" != true ]] && ! git show-ref --verify --quiet "refs/tags/${TAG}"; then
     git tag -a "${TAG}" -m "Wiki Sync ${TAG}"
 fi
 
 ARCHIVE_PATH="${WIKI_SYNC_DIR}/release/wiki-sync-${TAG}.zip"
 node "${REPO_ROOT}/scripts/create-release-archive.mjs" "${RELEASE_DIR}" "${ARCHIVE_PATH}"
 
-echo "[wiki-sync pre-push] Pushing tag ${TAG}..."
-git push --no-verify "${REMOTE_NAME}" "refs/tags/${TAG}:refs/tags/${TAG}"
+if [[ "${REMOTE_TAG_EXISTS}" != true ]]; then
+    echo "[wiki-sync pre-push] Pushing tag ${TAG}..."
+    git push --no-verify "${REMOTE_NAME}" "refs/tags/${TAG}:refs/tags/${TAG}"
+fi
 
 if command -v gh >/dev/null 2>&1; then
     echo "[wiki-sync pre-push] Publishing GitHub release ${TAG}..."
+    TARGET_COMMIT="$(git rev-parse "${TAG}^{commit}")"
     (
         cd "${REPO_ROOT}"
         gh release create "${TAG}" "${ARCHIVE_PATH}" \
             --title "Wiki Sync ${TAG}" \
+            --target "${TARGET_COMMIT}" \
             --generate-notes
     ) || echo "[wiki-sync pre-push] GitHub release creation failed. Branch push will continue."
 else

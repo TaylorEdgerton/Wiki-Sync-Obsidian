@@ -40,8 +40,8 @@ The plugin supports two authentication paths:
 
 ## Installation
 
-1. Build the plugin bundle or copy the generated `wiki-sync/release/wiki-sync/` directory into your vault's `.obsidian/plugins/wiki-sync/` directory.
-2. Or download the release and extract it into the .obsidian/plugins directory of your vault.
+1. Download the release and extract it into the .obsidian/plugins directory of your vault.
+or Build the plugin bundle or copy the generated `wiki-sync/release/wiki-sync/` directory into your vault's `.obsidian/plugins/wiki-sync/` directory.
 3. Use Obsidian Desktop `1.11.4` or newer so the plugin can use `SecretStorage` for local database passwords.
 4. Prepare a PostgreSQL 18 database with the TimescaleDB extension enabled.
 5. Restart Obsidian or reload community plugins.
@@ -213,6 +213,18 @@ npm run build
 ```
 
 That writes a release bundle to `release/wiki-sync/`.
+
+If you download or build the release zip, extract it into your vault plugin folder:
+
+```text
+<vault>/.obsidian/plugins/wiki-sync/
+```
+
+After extraction, `manifest.json` should be directly inside the plugin folder:
+
+```text
+<vault>/.obsidian/plugins/wiki-sync/manifest.json
+```
 
 To write the bundle directly into a vault plugin folder, set `WIKI_SYNC_OUT_DIR`:
 
