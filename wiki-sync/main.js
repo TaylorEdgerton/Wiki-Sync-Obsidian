@@ -2716,6 +2716,441 @@ class WikiSettingTab extends PluginSettingTab {
     }
 }
 
+
+// ============================================================================
+// POC: Right-click → New from template
+// Throwaway. To remove: delete this block + the `setupTemplateNewPOC(this)`
+// line in onload(). No other plugin code touched.
+// ============================================================================
+function setupTemplateNewPOC(plugin) {
+  const { TFolder, TFile } = require("obsidian");
+
+  function parseFrontmatter(raw) {
+    const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+    if (!m) return { frontmatter: {}, body: raw };
+    const fm = {};
+    const lines = m[1].split(/\r?\n/);
+    let i = 0;
+    while (i < lines.length) {
+      const km = lines[i].match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+      if (!km) { i++; continue; }
+      const key = km[1];
+      let val = km[2];
+      if (val === "") {
+        const arr = [];
+        i++;
+        while (i < lines.length && /^\s*-\s+/.test(lines[i])) {
+          arr.push(lines[i].replace(/^\s*-\s+/, "").replace(/^["']|["']$/g, ""));
+          i++;
+        }
+        fm[key] = arr;
+        continue;
+      }
+      val = val.trim().replace(/^["']|["']$/g, "");
+      const flow = val.match(/^\[\s*(.*?)\s*\]$/);
+      if (flow) {
+        fm[key] = flow[1]
+          .split(",")
+          .map(s => s.trim().replace(/^["']|["']$/g, ""))
+          .filter(Boolean);
+      } else if (val === "true") fm[key] = true;
+      else if (val === "false") fm[key] = false;
+      else fm[key] = val;
+      i++;
+    }
+    return { frontmatter: fm, body: m[2] };
+  }
+
+  function serializeFrontmatter(fm) {
+    let out = "";
+    for (const [k, v] of Object.entries(fm)) {
+      if (Array.isArray(v)) {
+        out += `${k}:\n`;
+        for (const item of v) out += `- "${String(item).replace(/"/g, '\\"')}"\n`;
+      } else if (typeof v === "boolean") {
+        out += `${k}: ${v}\n`;
+      } else if (v == null || v === "") {
+        out += `${k}: ""\n`;
+      } else {
+        out += `${k}: "${String(v).replace(/"/g, '\\"')}"\n`;
+      }
+    }
+    return out;
+  }
+
+  function today() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+  }
+  function nowLocal() {
+    const d = new Date();
+    return `${today()}T${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+  }
+
+  const { Modal, Setting, Notice } = require("obsidian");
+
+  class TemplateNewModal extends Modal {
+    constructor(app, templateFile, targetFolderPath) {
+      super(app);
+      this.templateFile = templateFile;
+      this.targetFolderPath = targetFolderPath;
+      this.values = {};
+    }
+    async onOpen() {
+      const raw = await this.app.vault.read(this.templateFile);
+      const { frontmatter, body } = parseFrontmatter(raw);
+      this.body = body;
+      this.keys = Object.keys(frontmatter);
+      this.titleEl.setText(`New from: ${this.templateFile.basename}`);
+      const { contentEl } = this;
+
+      new Setting(contentEl).setName("File name").setDesc("Without .md").addText(t => {
+        t.setPlaceholder("new-note");
+        t.onChange(v => this.values.__filename = v);
+      });
+
+      for (const key of this.keys) {
+        const v = frontmatter[key];
+        const setting = new Setting(contentEl).setName(key);
+
+        if (typeof v === "boolean") {
+          setting.addToggle(tg => { this.values[key] = v; tg.setValue(v); tg.onChange(x => this.values[key] = x); });
+        } else if (Array.isArray(v) && v.length > 1 && v.every(x => typeof x === "string")) {
+          setting.setDesc("Choose one");
+          setting.addDropdown(d => {
+            for (const opt of v) d.addOption(opt, opt);
+            this.values[key] = v[0]; d.setValue(v[0]);
+            d.onChange(x => this.values[key] = x);
+          });
+        } else if (Array.isArray(v)) {
+          setting.setDesc("Comma separated");
+          setting.addText(t => {
+            this.values[key] = v;
+            t.setValue(v.join(", "));
+            t.onChange(x => this.values[key] = x.split(",").map(s => s.trim()).filter(Boolean));
+          });
+        } else {
+          const s = String(v ?? "");
+          const isDateTimePlaceholder = s === "YYYY-MM-DD HH:MM";
+          const isRealDateTime = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}$/.test(s);
+          const isDatePlaceholder = s === "YYYY-MM-DD";
+          const isRealDate = /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+          if (isDateTimePlaceholder || isRealDateTime) {
+            setting.addText(t => {
+              t.inputEl.type = "datetime-local";
+              const start = isDateTimePlaceholder ? nowLocal() : s.replace(" ", "T");
+              const stored = start.replace("T", " ");
+              this.values[key] = stored; t.setValue(start);
+              t.onChange(x => this.values[key] = x.replace("T", " "));
+            });
+          } else if (isDatePlaceholder || isRealDate) {
+            setting.addText(t => {
+              t.inputEl.type = "date";
+              const start = isDatePlaceholder ? today() : s;
+              this.values[key] = start; t.setValue(start);
+              t.onChange(x => this.values[key] = x);
+            });
+          } else {
+            setting.addText(t => {
+              this.values[key] = s; t.setValue(s);
+              t.onChange(x => this.values[key] = x);
+            });
+          }
+        }
+
+      }
+
+      new Setting(contentEl).addButton(b =>
+        b.setButtonText("Create").setCta().onClick(() => this.submit(frontmatter))
+      );
+    }
+    async submit(templateFrontmatter) {
+      const filename = (this.values.__filename || "untitled").replace(/\.md$/, "").trim();
+      if (!filename) { new Notice("Need a file name"); return; }
+      const path = `${this.targetFolderPath}/${filename}.md`.replace(/^\/+/, "");
+      if (this.app.vault.getAbstractFileByPath(path)) { new Notice(`${path} already exists`); return; }
+      const merged = { ...templateFrontmatter };
+      for (const k of this.keys) if (this.values[k] !== undefined) merged[k] = this.values[k];
+      let filledBody = (this.body || "").replace(/^\r?\n+/, "");
+      filledBody = filledBody.replace(/\{\{\s*([A-Za-z0-9_-]+)\s*\}\}/g, (_, k) => {
+        const v = merged[k];
+        return Array.isArray(v) ? v.join(", ") : (v ?? "");
+      });
+      const content = `---\n${serializeFrontmatter(merged)}---\n\n${filledBody}`;
+      const file = await this.app.vault.create(path, content);
+      this.close();
+      this.app.workspace.getLeaf(true).openFile(file);
+    }
+  }
+
+  function findTemplatesForTarget(target) {
+    if (!target) return { targetFolder: null, templates: [] };
+    const folder = target instanceof TFolder ? target : target.parent;
+    if (!folder) return { targetFolder: null, templates: [] };
+    const templates = [];
+    for (const c of folder.children) {
+      if (c instanceof TFile && (c.basename === "_template" || c.basename === "template")) templates.push(c);
+    }
+    const tplSub = folder.children.find(c => c instanceof TFolder && c.name === "templates");
+    if (tplSub) for (const c of tplSub.children) if (c instanceof TFile && c.extension === "md") templates.push(c);
+    return { targetFolder: folder, templates };
+  }
+
+  plugin.registerEvent(plugin.app.workspace.on("file-menu", (menu, file) => {
+    const { targetFolder, templates } = findTemplatesForTarget(file);
+    if (!targetFolder || templates.length === 0) return;
+    if (templates.length === 1) {
+      menu.addItem(item => item
+        .setTitle(`New from template: ${templates[0].basename}`)
+        .setIcon("file-plus")
+        .onClick(() => new TemplateNewModal(plugin.app, templates[0], targetFolder.path).open()));
+    } else {
+      menu.addItem(parent => {
+        parent.setTitle("New from template").setIcon("file-plus");
+        const sub = parent.setSubmenu();
+        for (const tpl of templates) {
+          sub.addItem(i => i
+            .setTitle(tpl.basename)
+            .onClick(() => new TemplateNewModal(plugin.app, tpl, targetFolder.path).open()));
+        }
+      });
+    }
+  }));
+
+
+}
+// ============================================================================
+// END POC
+// ============================================================================
+
+
+// ============================================================================
+// POC: Inline wiki-query (SQL against the synced DB)
+// ============================================================================
+function setupWikiQueryPOC(plugin) {
+  // Translate `FROM oncall/contacts` → `FROM (SELECT * FROM wiki.oncall
+  // WHERE filename LIKE 'contacts/%' AND filetype='file') AS oncall`
+  // so downstream WHERE/SELECT can reference `headers`, `title`, etc. naturally.
+  function translateWikiPaths(sql) {
+    return sql.replace(
+      /(\bFROM\s+|\bJOIN\s+)([a-zA-Z_][\w]*)(?:\/([a-zA-Z0-9_.\/-]+))?/gi,
+      (_m, verb, app, subpath) => {
+        const table = `wiki.${app}`;
+        if (!subpath) return `${verb}${table}`;
+        const safe = subpath.replace(/'/g, "''");
+        return `${verb}(SELECT * FROM ${table} WHERE filename LIKE '${safe}/%' AND filetype = 'file') AS ${app}`;
+      }
+    );
+  }
+
+  const BASE_COLS = new Set([
+    "id", "filename", "filetype", "title", "author", "body",
+    "encoding", "created_at", "modified_at", "headers"
+  ]);
+
+  const SQL_KEYWORDS = new Set([
+    "select","from","where","and","or","not","in","is","like","ilike","between",
+    "order","by","group","having","limit","offset","asc","desc","as","join","on",
+    "left","right","inner","outer","full","cross","case","when","then","else","end",
+    "distinct","all","true","false","null","exists","any","some",
+    "count","sum","avg","min","max","string_agg","array_agg"
+  ]);
+
+  const WIKI_QUERY_FORBIDDEN_KEYWORDS = [
+    "ALTER", "ANALYZE", "CALL", "COMMENT", "COMMIT", "COPY", "CREATE", "DELETE",
+    "DROP", "EXECUTE", "GRANT", "INSERT", "LISTEN", "LOCK", "MERGE", "NOTIFY",
+    "REFRESH", "REINDEX", "REVOKE", "ROLLBACK", "SET", "TRUNCATE", "UNLISTEN",
+    "UPDATE", "VACUUM"
+  ];
+
+  function maskSqlLiteralsAndComments(sql) {
+    let out = "";
+    let i = 0;
+    const mask = (text) => " ".repeat(text.length);
+    while (i < sql.length) {
+      const rest = sql.slice(i);
+      const dollar = rest.match(/^\$[A-Za-z_]\w*\$|^\$\$/);
+      if (dollar) {
+        const tag = dollar[0];
+        const end = sql.indexOf(tag, i + tag.length);
+        const n = end === -1 ? sql.length - i : end + tag.length - i;
+        out += mask(sql.slice(i, i + n));
+        i += n;
+        continue;
+      }
+      if (sql.startsWith("--", i)) {
+        const end = sql.indexOf("\n", i + 2);
+        const n = end === -1 ? sql.length - i : end - i;
+        out += mask(sql.slice(i, i + n));
+        i += n;
+        continue;
+      }
+      if (sql.startsWith("/*", i)) {
+        const end = sql.indexOf("*/", i + 2);
+        const n = end === -1 ? sql.length - i : end + 2 - i;
+        out += mask(sql.slice(i, i + n));
+        i += n;
+        continue;
+      }
+      const quote = sql[i];
+      if (quote === "'" || quote === '"') {
+        const start = i;
+        i += 1;
+        while (i < sql.length) {
+          if (sql[i] === quote) {
+            if (sql[i + 1] === quote) {
+              i += 2;
+              continue;
+            }
+            i += 1;
+            break;
+          }
+          i += 1;
+        }
+        out += mask(sql.slice(start, i));
+        continue;
+      }
+      out += sql[i];
+      i += 1;
+    }
+    return out;
+  }
+
+  function assertSafeWikiQuery(sql) {
+    const masked = maskSqlLiteralsAndComments(String(sql || ""));
+    const withoutTrailingSemicolon = masked.replace(/;\s*$/, "");
+    if (withoutTrailingSemicolon.includes(";")) {
+      throw new Error("wiki-query allows one statement at a time.");
+    }
+    if (!/^\s*(SELECT|WITH)\b/i.test(withoutTrailingSemicolon)) {
+      throw new Error("wiki-query only allows read queries that start with SELECT or WITH.");
+    }
+    const forbidden = WIKI_QUERY_FORBIDDEN_KEYWORDS.find((kw) => new RegExp(`\\b${kw}\\b`, "i").test(masked));
+    if (forbidden) {
+      throw new Error(`wiki-query blocked unsafe SQL keyword: ${forbidden}`);
+    }
+  }
+
+  function splitTopLevel(s, sep) {
+    const out = []; let depth = 0, cur = "", inStr = false, q = "";
+    for (const ch of s) {
+      if (inStr) { cur += ch; if (ch === q) inStr = false; continue; }
+      if (ch === "'" || ch === '"') { inStr = true; q = ch; cur += ch; continue; }
+      if (ch === "(") depth++; else if (ch === ")") depth--;
+      if (ch === sep && depth === 0) { out.push(cur); cur = ""; continue; }
+      cur += ch;
+    }
+    if (cur.trim()) out.push(cur);
+    return out;
+  }
+
+  function isBareIdent(tok) {
+    return /^[a-zA-Z_]\w*$/.test(tok) && !SQL_KEYWORDS.has(tok.toLowerCase());
+  }
+
+  // SELECT bare-ident  →  headers->'ident' AS ident  (unless base column)
+  function rewriteSelectList(sql) {
+    return sql.replace(/\bSELECT\b([\s\S]+?)\bFROM\b/i, (_, list) => {
+      const cols = splitTopLevel(list, ",").map(raw => {
+        const t = raw.trim();
+        if (!t || t === "*") return t;
+        if (/[()]|->|\s+AS\s+/i.test(t)) return t;                         // expression, leave alone
+        if (!isBareIdent(t)) return t;
+        if (BASE_COLS.has(t.toLowerCase())) return t;
+        return `headers->'${t}' AS ${t}`;
+      });
+      return `SELECT ${cols.join(", ")} FROM`;
+    });
+  }
+
+  // WHERE bare-ident OP value  →  headers->>'ident' OP value
+  // WHERE bare-ident CONTAINS 'x'  →  headers->'ident' ? 'x'
+  function rewritePredicates(sql) {
+    return sql.replace(
+      /\b([a-zA-Z_]\w*)\s*(=|!=|<>|<=|>=|<|>|\bLIKE\b|\bILIKE\b|\bIN\b|\bCONTAINS\b)/gi,
+      (m, col, op) => {
+        const lower = col.toLowerCase();
+        if (BASE_COLS.has(lower) || SQL_KEYWORDS.has(lower)) return m;
+        if (op.toUpperCase() === "CONTAINS") return `headers->'${col}' ?`;
+        return `headers->>'${col}' ${op}`;
+      }
+    );
+  }
+
+  // After SQL returns, collapse jsonb arrays to "a; b; c" so single-col inline works.
+  function flattenRows(rows) {
+    return rows.map(r => {
+      const out = {};
+      for (const [k, v] of Object.entries(r)) {
+        if (Array.isArray(v)) out[k] = v.join("; ");
+        else if (v !== null && typeof v === "object") out[k] = JSON.stringify(v);
+        else out[k] = v;
+      }
+      return out;
+    });
+  }
+
+  async function runQuery(sql) {
+    assertSafeWikiQuery(sql);
+    const translated = rewritePredicates(rewriteSelectList(translateWikiPaths(sql)));
+    const rows = await plugin.contentStore.query(plugin.dbConnection, translated);
+    const flat = flattenRows(rows || []);
+    return { rows: flat, cols: flat[0] ? Object.keys(flat[0]) : [] };
+  }
+
+
+  function formatInline({ rows, cols }) {
+    if (!rows.length) return "(no rows)";
+    if (rows.length === 1 && cols.length === 1) return String(rows[0][cols[0]] ?? "");
+    if (cols.length === 1) return rows.map(r => r[cols[0]]).filter(v => v != null && v !== "").join("; ");
+    return rows.map(r => cols.map(c => r[c]).join(" | ")).join("; ");
+  }
+
+  function renderTable(el, { rows, cols }) {
+    if (!rows.length) { el.createEl("em", { text: "(no rows)" }); return; }
+    const tbl = el.createEl("table");
+    const thr = tbl.createEl("thead").createEl("tr");
+    cols.forEach(c => thr.createEl("th", { text: c }));
+    const tb = tbl.createEl("tbody");
+    for (const r of rows) {
+      const tr = tb.createEl("tr");
+      cols.forEach(c => tr.createEl("td", { text: r[c] == null ? "" : String(r[c]) }));
+    }
+  }
+
+  // Block form:  ```wiki-query  SELECT ...  ```
+  plugin.registerMarkdownCodeBlockProcessor("wiki-query", async (source, el) => {
+    try {
+      const result = await runQuery(source);
+      // single col → render as joined text so you can copy it out of reading view
+      if (result.cols.length <= 1) el.createSpan({ text: formatInline(result) });
+      else renderTable(el, result);
+    } catch (err) {
+      el.createEl("pre", { text: `Query error: ${err.message}` });
+    }
+  });
+
+  // Inline form:  `q: SELECT ...`
+  plugin.registerMarkdownPostProcessor(async (el) => {
+    const codes = Array.from(el.querySelectorAll("code"));
+    for (const code of codes) {
+      const text = code.textContent || "";
+      if (!text.startsWith("q:")) continue;
+      try {
+        const result = await runQuery(text.slice(2).trim());
+        const span = document.createElement("span");
+        span.textContent = formatInline(result);
+        code.replaceWith(span);
+      } catch (err) {
+        code.textContent = `[query error: ${err.message}]`;
+      }
+    }
+  });
+}
+// ============================================================================
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Plugin Lifecycle, Commands, and Sync Management
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2789,7 +3224,8 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this.registerSyncFolderListeners();
         this.registerCommands();
         this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => this.handleFileMenu(menu, file)));
-
+        setupTemplateNewPOC(this);
+        setupWikiQueryPOC(this)
         this.recomputeState();
         this.recomputeConnectionState();
         if (this.settings.autoSync && this.isCloned()) void this.doSync();
