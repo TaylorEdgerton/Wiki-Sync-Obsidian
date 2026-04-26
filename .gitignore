@@ -19,3 +19,9 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+.gitnexus
+
+# Local planning/context files
+plan.md
+feature01.md
+.codex

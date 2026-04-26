@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from .config import HelperConfig, load_config
 from .embeddings import FakeEmbeddingProvider
-from .privacy import FakeDetector, InMemoryEntityMap, LocalXorCipher, reveal_text, sanitize_text
+from .privacy import Detector, FakeDetector, InMemoryEntityMap, LocalXorCipher, PresidioDetector, reveal_text, sanitize_text
 from .search import InMemorySearchIndex, content_hash
 
 
@@ -20,21 +20,40 @@ ROUTE_STUBS = {
 }
 
 
+def _build_detector(config: HelperConfig) -> Detector:
+    if config.anonymizer_provider == "presidio":
+        try:
+            return PresidioDetector.create(config.presidio_language, model=config.presidio_model)
+        except ImportError as exc:
+            import warnings
+            warnings.warn(
+                f"presidio detector unavailable, falling back to FakeDetector: {exc}",
+                stacklevel=2,
+            )
+    return FakeDetector({})
+
+
 @dataclass
 class HelperState:
-    detector: FakeDetector = field(default_factory=lambda: FakeDetector({}))
+    detector: Detector = field(default_factory=lambda: FakeDetector({}))
     entity_map: InMemoryEntityMap = field(default_factory=InMemoryEntityMap)
     cipher: LocalXorCipher = field(default_factory=LocalXorCipher)
     index: InMemorySearchIndex = field(default_factory=InMemorySearchIndex)
 
+    @property
+    def anonymizer_active(self) -> str:
+        return "presidio" if isinstance(self.detector, PresidioDetector) else "fake"
 
-def health_payload(config: HelperConfig) -> dict[str, Any]:
+
+def health_payload(config: HelperConfig, state: "HelperState | None" = None) -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "wiki-helper",
         "databaseConfigured": bool(config.database_url),
         "embeddingProvider": config.embedding_provider,
         "embeddingDimension": config.embedding_dimension,
+        "anonymizerConfigured": config.anonymizer_provider,
+        "anonymizerActive": state.anonymizer_active if state else "unknown",
     }
 
 
@@ -123,6 +142,7 @@ def _reveal_text(payload: dict[str, Any], state: HelperState) -> dict[str, Any]:
 
 def make_handler(config: HelperConfig, state: HelperState | None = None) -> type[BaseHTTPRequestHandler]:
     resolved_state = state or HelperState(
+        detector=_build_detector(config),
         index=InMemorySearchIndex(FakeEmbeddingProvider(config.embedding_dimension)),
     )
 
@@ -135,7 +155,7 @@ def make_handler(config: HelperConfig, state: HelperState | None = None) -> type
         def do_GET(self) -> None:
             path = urlparse(self.path).path
             if path == "/health":
-                _send_json(self, 200, health_payload(config))
+                _send_json(self, 200, health_payload(config, resolved_state))
                 return
             _send_json(self, 404, {"error": "not_found"})
 

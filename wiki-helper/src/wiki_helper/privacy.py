@@ -44,6 +44,11 @@ class RevealResult:
     unresolved_placeholders: tuple[str, ...] = ()
 
 
+class Detector(Protocol):
+    def detect(self, text: str) -> list[EntityMatch]:
+        ...
+
+
 class ValueCipher(Protocol):
     def encrypt(self, value: str) -> bytes:
         ...
@@ -116,6 +121,66 @@ class FakeDetector:
                 for match in pattern.finditer(text):
                     matches.append(EntityMatch(entity_type, match.start(), match.end(), match.group(0)))
         return _without_overlaps(matches, existing_placeholder_spans(text))
+
+
+class PresidioDetector:
+    """NLP-based PII detector backed by Microsoft Presidio + spaCy.
+
+    Requires the ``presidio`` optional extras and a downloaded spaCy model::
+
+        pip install 'wiki-helper[presidio]'
+        python -m spacy download en_core_web_sm
+    """
+
+    def __init__(self, analyzer: object, language: str = "en", score_threshold: float = 0.5) -> None:
+        self._analyzer = analyzer
+        self._language = language
+        self._score_threshold = score_threshold
+
+    @classmethod
+    def create(
+        cls,
+        language: str = "en",
+        score_threshold: float = 0.5,
+        model: str = "en_core_web_sm",
+    ) -> "PresidioDetector":
+        try:
+            from presidio_analyzer import AnalyzerEngine  # type: ignore[import-untyped]
+            from presidio_analyzer.nlp_engine import NlpEngineProvider  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "presidio-analyzer is not installed. "
+                "Install with: pip install 'wiki-helper[presidio]'"
+            ) from exc
+        try:
+            provider = NlpEngineProvider(
+                nlp_configuration={
+                    "nlp_engine_name": "spacy",
+                    "models": [{"lang_code": language, "model_name": model}],
+                }
+            )
+            engine = provider.create_engine()
+        except OSError as exc:
+            raise ImportError(
+                f"spaCy model '{model}' is not installed. "
+                f"Run: python -m spacy download {model}"
+            ) from exc
+        return cls(AnalyzerEngine(nlp_engine=engine), language, score_threshold)
+
+    def detect(self, text: str) -> list[EntityMatch]:
+        results = self._analyzer.analyze(text=text, language=self._language)
+        blocked = existing_placeholder_spans(text)
+        matches = [
+            EntityMatch(
+                entity_type=r.entity_type,
+                start=r.start,
+                end=r.end,
+                text=text[r.start : r.end],
+            )
+            for r in results
+            if r.score >= self._score_threshold
+        ]
+        return _without_overlaps(matches, blocked)
 
 
 PLACEHOLDER_RE = re.compile(r"\[\[PRIVATE:([A-Z0-9_]+):([A-F0-9]{12,64})\]\]")

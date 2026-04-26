@@ -9,6 +9,12 @@ description = "Local privacy and retrieval helper for Wiki Sync."
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+presidio = [
+    "presidio-analyzer>=2.2",
+    "spacy>=3.7",
+]
+
 [project.scripts]
 wiki-helper = "wiki_helper.app:main"
 

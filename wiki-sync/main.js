@@ -150,6 +150,9 @@ const DEFAULT_SETTINGS = {
     syncSubdir:       'wiki',
     autoSync:         false,
     scaffoldProfile:  DEFAULT_AI_SCAFFOLD_PROFILE,
+    privacyHelperEnabled: false,
+    privacyHelperAutoStart: false,
+    privacyHelperUrl: 'http://127.0.0.1:8765',
 };
 
 function quoteDbIdent(value) {
@@ -963,6 +966,36 @@ function formatLocalDatabaseTarget(settings) {
     return `${dbPart} on ${hostPart}${portPart} as ${userPart}`;
 }
 
+function normalizeSafeVaultRelativePath(value, fallback) {
+    const fallbackValue = typeof fallback === 'string' && fallback.trim()
+        ? fallback.trim().replace(/\\/g, '/').replace(/^\/+/, '')
+        : '';
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw || raw.includes('\0')) return fallbackValue;
+    if (/^[A-Za-z]:/.test(raw)) return fallbackValue;
+    if (/^[\\/]{2,}/.test(raw)) return fallbackValue;
+
+    const slashNormalized = raw.replace(/\\/g, '/').replace(/^\/+/, '');
+    const parts = slashNormalized.split('/').filter(Boolean);
+    if (!parts.length || parts.some(part => part === '.' || part === '..')) return fallbackValue;
+
+    const normalized = path.posix.normalize(slashNormalized);
+    if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../')) return fallbackValue;
+    return normalized;
+}
+
+function normalizeHttpEndpoint(value, fallback) {
+    const raw = typeof value === 'string' && value.trim() ? value.trim() : fallback;
+    try {
+        const parsed = new url.URL(raw);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fallback;
+        parsed.hash = '';
+        return parsed.toString().replace(/\/+$/, '');
+    } catch (_error) {
+        return fallback;
+    }
+}
+
 function normalizeSettings(rawSettings = {}) {
     const source = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
     const settings = Object.assign({}, DEFAULT_SETTINGS);
@@ -975,9 +1008,7 @@ function normalizeSettings(rawSettings = {}) {
     settings.oidcDbName = typeof source.oidcDbName === 'string' && source.oidcDbName.trim()
         ? source.oidcDbName.trim()
         : DEFAULT_SETTINGS.oidcDbName;
-    settings.syncSubdir = typeof source.syncSubdir === 'string' && source.syncSubdir.trim()
-        ? source.syncSubdir.trim()
-        : DEFAULT_SETTINGS.syncSubdir;
+    settings.syncSubdir = normalizeSafeVaultRelativePath(source.syncSubdir, DEFAULT_SETTINGS.syncSubdir);
     settings.autoSync = typeof source.autoSync === 'boolean'
         ? source.autoSync
         : DEFAULT_SETTINGS.autoSync;
@@ -1004,6 +1035,13 @@ function normalizeSettings(rawSettings = {}) {
     settings.scaffoldProfile = Object.prototype.hasOwnProperty.call(AI_SCAFFOLD_PROFILES, settings.scaffoldProfile)
         ? settings.scaffoldProfile
         : DEFAULT_AI_SCAFFOLD_PROFILE;
+    settings.privacyHelperEnabled = typeof source.privacyHelperEnabled === 'boolean'
+        ? source.privacyHelperEnabled
+        : DEFAULT_SETTINGS.privacyHelperEnabled;
+    settings.privacyHelperAutoStart = typeof source.privacyHelperAutoStart === 'boolean'
+        ? source.privacyHelperAutoStart
+        : DEFAULT_SETTINGS.privacyHelperAutoStart;
+    settings.privacyHelperUrl = normalizeHttpEndpoint(source.privacyHelperUrl, DEFAULT_SETTINGS.privacyHelperUrl);
     return { settings, strippedLocalConnPassword: localConnStr.strippedPassword };
 }
 
@@ -1029,6 +1067,9 @@ function buildPersistedSettings(rawSettings = {}) {
         syncSubdir: settings.syncSubdir,
         autoSync: settings.autoSync,
         scaffoldProfile: settings.scaffoldProfile,
+        privacyHelperEnabled: settings.privacyHelperEnabled,
+        privacyHelperAutoStart: settings.privacyHelperAutoStart,
+        privacyHelperUrl: settings.privacyHelperUrl,
     };
 }
 
@@ -1080,6 +1121,87 @@ function renderAiScaffoldTemplate(templateContent, profile, syncRoot = DEFAULT_S
         (content, [key, value]) => content.split(`{{${key}}}`).join(value),
         templateContent,
     );
+}
+
+class WikiRagClient {
+    constructor(settings = {}) {
+        this.enabled = !!settings.privacyHelperEnabled;
+        this.autoStart = !!settings.privacyHelperAutoStart;
+        this.baseUrl = normalizeHttpEndpoint(settings.privacyHelperUrl, DEFAULT_SETTINGS.privacyHelperUrl);
+    }
+
+    health() {
+        return this.request('GET', 'health');
+    }
+
+    sanitizeNote(payload) {
+        return this.request('POST', 'sanitize-note', payload);
+    }
+
+    indexNote(payload) {
+        return this.request('POST', 'index-note', payload);
+    }
+
+    revealText(payload) {
+        return this.request('POST', 'reveal-text', payload);
+    }
+
+    searchWiki(payload) {
+        return this.request('POST', 'search-wiki', payload);
+    }
+
+    request(method, endpoint, payload) {
+        return new Promise((resolve, reject) => {
+            let parsed;
+            try {
+                parsed = new url.URL(String(endpoint).replace(/^\/+/, ''), `${this.baseUrl}/`);
+            } catch (error) {
+                reject(new Error(`Invalid wiki helper URL: ${error.message}`));
+                return;
+            }
+
+            const body = payload === undefined ? '' : JSON.stringify(payload);
+            const isHttps = parsed.protocol === 'https:';
+            const headers = { Accept: 'application/json' };
+            if (method !== 'GET') {
+                headers['Content-Type'] = 'application/json';
+                headers['Content-Length'] = Buffer.byteLength(body);
+            }
+
+            const req = (isHttps ? https : http).request({
+                hostname: parsed.hostname,
+                port: parsed.port || (isHttps ? 443 : 80),
+                path: parsed.pathname + parsed.search,
+                method,
+                headers,
+            }, res => {
+                let data = '';
+                res.on('data', chunk => { data += chunk; });
+                res.on('end', () => {
+                    let parsedBody = null;
+                    if (data.trim()) {
+                        try {
+                            parsedBody = JSON.parse(data);
+                        } catch (error) {
+                            reject(new Error(`Bad wiki helper response: ${error.message}`));
+                            return;
+                        }
+                    }
+
+                    if (res.statusCode < 200 || res.statusCode >= 300) {
+                        const message = parsedBody?.error || parsedBody?.message || data.trim();
+                        reject(new Error(`Wiki helper HTTP ${res.statusCode}${message ? `: ${message}` : ''}`));
+                        return;
+                    }
+                    resolve(parsedBody);
+                });
+            });
+            req.setTimeout(5000, () => req.destroy(new Error('Wiki helper request timed out.')));
+            req.on('error', reject);
+            if (method !== 'GET') req.write(body);
+            req.end();
+        });
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1988,6 +2110,7 @@ function* walkLocalSyncFiles(root, relBase = '') {
 }
 
 function commandExists(command) {
+    if (path.isAbsolute(command)) return fs.existsSync(command);
     if (isWindowsHost()) {
         try {
             execFileSync('where.exe', [command], {
@@ -2025,7 +2148,181 @@ function importEngineAvailable(engine) {
     }
 }
 
-function detectImportEngine() {
+function detectHelperPythonRuntime() {
+    const candidates = [
+        { command: 'py.exe', args: ['-3'], label: 'Windows Python launcher' },
+        { command: 'python.exe', args: [], label: 'Windows Python' },
+        { command: 'python3', args: [], label: 'Python 3' },
+        { command: 'python', args: [], label: 'Python' },
+    ];
+
+    for (const candidate of candidates) {
+        if (!commandExists(candidate.command)) continue;
+        try {
+            execFileSync(candidate.command, [...candidate.args, '-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'], {
+                timeout: 5000,
+                encoding: 'utf8',
+                stdio: 'pipe',
+                windowsHide: true,
+            });
+            return Object.assign({ available: true }, candidate);
+        } catch {
+            continue;
+        }
+    }
+
+    return {
+        available: false,
+        command: '',
+        args: [],
+        label: 'Python 3.11+ not found',
+    };
+}
+
+function getVenvPython(helperDir) {
+    const isWin = process.platform === 'win32';
+    return isWin
+        ? path.join(helperDir, '.venv', 'Scripts', 'python.exe')
+        : path.join(helperDir, '.venv', 'bin', 'python');
+}
+
+function requirementsHash(helperDir) {
+    const reqPath = path.join(helperDir, 'requirements.txt');
+    if (!fs.existsSync(reqPath)) return '';
+    return crypto.createHash('sha256').update(fs.readFileSync(reqPath)).digest('hex');
+}
+
+function venvNeedsUpdate(helperDir) {
+    const venvPython = getVenvPython(helperDir);
+    if (!fs.existsSync(venvPython)) return true;
+    const hashFile = path.join(helperDir, '.venv', 'requirements.hash');
+    if (!fs.existsSync(hashFile)) return true;
+    return fs.readFileSync(hashFile, 'utf8').trim() !== requirementsHash(helperDir);
+}
+
+function detectVenvPythonRuntime() {
+    // Prefer 3.12 then 3.11 — both have stable spaCy/presidio wheels.
+    // Avoid 3.13+ which still lacks pre-built wheels for many ML deps.
+    const preferred = [
+        { command: 'py.exe', args: ['-3.12'], label: 'Python 3.12 (Windows)' },
+        { command: 'py.exe', args: ['-3.11'], label: 'Python 3.11 (Windows)' },
+        { command: 'python3.12', args: [], label: 'Python 3.12' },
+        { command: 'python3.11', args: [], label: 'Python 3.11' },
+    ];
+    for (const candidate of preferred) {
+        if (!commandExists(candidate.command)) continue;
+        try {
+            execFileSync(candidate.command, [...candidate.args, '-c',
+                'import sys; raise SystemExit(0 if (3,11) <= sys.version_info < (3,13) else 1)'], {
+                timeout: 5000, encoding: 'utf8', stdio: 'pipe', windowsHide: true,
+            });
+            return Object.assign({ available: true }, candidate);
+        } catch { continue; }
+    }
+    // Fall back to whatever the general runtime detector found (may be 3.13+).
+    return detectHelperPythonRuntime();
+}
+
+let _venvInstallPromise = null;
+
+async function ensureHelperVenv(helperDir, runtime, { showNotice = false, force = false } = {}) {
+    if (!force && !venvNeedsUpdate(helperDir)) return getVenvPython(helperDir);
+
+    // Deduplicate concurrent calls — return the in-progress install if one is already running.
+    if (_venvInstallPromise) return _venvInstallPromise;
+    _venvInstallPromise = _doInstallHelperVenv(helperDir, runtime, { showNotice })
+        .finally(() => { _venvInstallPromise = null; });
+    return _venvInstallPromise;
+}
+
+async function _doInstallHelperVenv(helperDir, runtime, { showNotice = false } = {}) {
+
+    const reqPath = path.join(helperDir, 'requirements.txt');
+    if (!fs.existsSync(reqPath)) return null;
+
+    // Omit duration so the notice persists until we explicitly hide it.
+    let stepNotice = showNotice ? new Notice('Wiki helper: preparing…') : null;
+    const setStep = (msg, detail = '') => {
+        const text = detail ? `${msg}\n${detail}` : msg;
+        console.log(`[Wiki Sync] ${msg}${detail ? ' — ' + detail : ''}`);
+        if (stepNotice) stepNotice.setMessage(text);
+    };
+
+    const runStep = (command, args, label, { liveDetail = false } = {}) => new Promise((resolve, reject) => {
+        const proc = spawn(command, args, { cwd: helperDir, stdio: 'pipe', windowsHide: true });
+        const allOut = [];
+        const onData = chunk => {
+            allOut.push(chunk);
+            const text = chunk.toString('utf8');
+            text.split('\n').map(l => l.trim()).filter(Boolean).forEach(l =>
+                console.log(`[Wiki Sync] ${label}: ${l}`)
+            );
+            if (liveDetail && stepNotice) {
+                const lastLine = text.trim().split('\n').pop().trim();
+                if (lastLine) stepNotice.setMessage(`${label}…\n${lastLine.slice(0, 80)}`);
+            }
+        };
+        proc.stdout?.on('data', onData);
+        proc.stderr?.on('data', onData);
+        proc.on('exit', code => {
+            const text = Buffer.concat(allOut).toString('utf8').trim();
+            if (code === 0) {
+                resolve(text);
+            } else {
+                console.error(`[Wiki Sync] ${label} failed (exit ${code}):\n${text}`);
+                reject(new Error(`${label} failed (exit ${code}) — open dev console for details`));
+            }
+        });
+        proc.on('error', err => {
+            console.error(`[Wiki Sync] ${label} spawn error: ${err.message}`);
+            reject(new Error(`${label}: ${err.message}`));
+        });
+    });
+
+    try {
+        const venvPath = path.join(helperDir, '.venv');
+        const venvRuntime = detectVenvPythonRuntime();
+        if (!venvRuntime.available) throw new Error('Python 3.11 or 3.12 is required but not found on PATH.');
+        setStep('Wiki helper: creating virtual environment…', `using ${venvRuntime.label}`);
+        await runStep(venvRuntime.command, [...venvRuntime.args, '-m', 'venv', venvPath], 'venv create');
+
+        const venvPython = getVenvPython(helperDir);
+        setStep('Wiki helper: installing dependencies…', 'this may take a minute');
+        await runStep(venvPython, ['-m', 'pip', 'install', '-r', reqPath, '--progress-bar', 'off'],
+            'Installing packages', { liveDetail: true });
+
+        setStep('Wiki helper: downloading language model…');
+        await runStep(venvPython, ['-m', 'spacy', 'download', 'en_core_web_sm'],
+            'Downloading model', { liveDetail: true });
+
+        fs.writeFileSync(path.join(helperDir, '.venv', 'requirements.hash'), requirementsHash(helperDir));
+        setStep('Wiki helper: dependencies ready ✓');
+        await new Promise(r => setTimeout(r, 2000));
+        return venvPython;
+    } catch (err) {
+        if (stepNotice) stepNotice.setMessage(`Wiki helper install failed:\n${err.message}`);
+        // Leave the error notice visible — don't hide it.
+        stepNotice = null;
+        throw err;
+    } finally {
+        if (stepNotice) stepNotice.hide();
+    }
+}
+
+function detectImportEngine(helperDir) {
+    const venvCandidates = helperDir ? (() => {
+        const venvPython = getVenvPython(helperDir);
+        if (!fs.existsSync(venvPython)) return [];
+        return [{
+            id: 'python-markitdown',
+            command: venvPython,
+            args: ['-m', 'markitdown'],
+            label: 'Wiki helper markitdown',
+            description: 'Uses markitdown from the Wiki helper managed environment.',
+            host: 'venv',
+        }];
+    })() : [];
+
     const windowsCandidates = [
         {
             id: 'python-markitdown',
@@ -2087,7 +2384,7 @@ function detectImportEngine() {
         },
     ];
 
-    for (const candidate of [...windowsCandidates, ...hostCandidates]) {
+    for (const candidate of [...venvCandidates, ...windowsCandidates, ...hostCandidates]) {
         if (!importEngineAvailable(candidate)) continue;
         return Object.assign({ available: true }, candidate);
     }
@@ -2113,7 +2410,7 @@ function describeImportEngine(engine) {
 }
 
 function ensurePythonMarkItDownInstalled(plugin) {
-    plugin.importEngine = detectImportEngine();
+    plugin.importEngine = detectImportEngine(plugin.helperDir());
     if (plugin.importEngine.available) return plugin.importEngine;
 
     new Notice(plugin.importEngine.description, 8000);
@@ -2424,6 +2721,118 @@ function reportImportError(message, error) {
     console.error('[Wiki Sync][Import]', message, error);
 }
 
+function importedAppName(plugin, syncRel) {
+    const appName = plugin.contentStore?.appFromSyncPath(syncRel);
+    if (appName) return appName;
+    const segments = String(syncRel || '').split('/').filter(Boolean);
+    return segments.length > 1 ? segments[0] : 'wiki';
+}
+
+async function sanitizeImportedMarkdown(plugin, syncRel, rawMarkdown) {
+    if (!plugin.settings.privacyHelperEnabled) return rawMarkdown;
+
+    const client = plugin.wikiRagClient || new WikiRagClient(plugin.settings);
+    const appName = importedAppName(plugin, syncRel);
+    const sanitized = await client.sanitizeNote({ appName, path: syncRel, rawMarkdown });
+    if (!sanitized || typeof sanitized.sanitizedMarkdown !== 'string') {
+        throw new Error('Wiki helper did not return sanitized Markdown.');
+    }
+
+    const rawContentHash = typeof sanitized.rawContentHash === 'string'
+        ? sanitized.rawContentHash
+        : sha256Buffer(Buffer.from(rawMarkdown, 'utf8'));
+    await client.indexNote({
+        appName,
+        path: syncRel,
+        sanitizedMarkdown: sanitized.sanitizedMarkdown,
+        rawContentHash,
+    });
+    return sanitized.sanitizedMarkdown;
+}
+
+function preparedVaultBuffer(buffer) {
+    return {
+        buffer,
+        hash: sha256Buffer(buffer),
+        size: buffer.length,
+        sanitizedMarkdown: buffer.toString('utf8'),
+        rawContentHash: sha256Buffer(buffer),
+    };
+}
+
+async function prepareRemoteBufferForVault(plugin, syncRel, rawBuffer) {
+    if (!plugin.settings.privacyHelperEnabled) return preparedVaultBuffer(rawBuffer);
+
+    const rawMarkdown = rawBuffer.toString('utf8');
+    const client = plugin.wikiRagClient || new WikiRagClient(plugin.settings);
+    const appName = importedAppName(plugin, syncRel);
+    const sanitized = await client.sanitizeNote({ appName, path: syncRel, rawMarkdown });
+    if (!sanitized || typeof sanitized.sanitizedMarkdown !== 'string') {
+        throw new Error('Wiki helper did not return sanitized Markdown.');
+    }
+
+    const rawContentHash = typeof sanitized.rawContentHash === 'string'
+        ? sanitized.rawContentHash
+        : sha256Buffer(rawBuffer);
+
+    const buffer = Buffer.from(sanitized.sanitizedMarkdown, 'utf8');
+    return {
+        buffer,
+        hash: sha256Buffer(buffer),
+        size: buffer.length,
+        sanitizedMarkdown: sanitized.sanitizedMarkdown,
+        rawContentHash,
+    };
+}
+
+async function indexPreparedVaultBuffer(plugin, syncRel, vaultFile) {
+    if (!plugin.settings.privacyHelperEnabled) return;
+
+    const client = plugin.wikiRagClient || new WikiRagClient(plugin.settings);
+    const appName = importedAppName(plugin, syncRel);
+    await client.indexNote({
+        appName,
+        path: syncRel,
+        sanitizedMarkdown: vaultFile.sanitizedMarkdown,
+        rawContentHash: vaultFile.rawContentHash,
+    });
+}
+
+async function prepareLocalBufferForPush(plugin, syncRel, localBuf) {
+    if (!plugin.settings.privacyHelperEnabled) {
+        return { remoteBuf: localBuf, canonicalBuf: null, unresolvedPlaceholders: [] };
+    }
+
+    const client = plugin.wikiRagClient || new WikiRagClient(plugin.settings);
+    const appName = importedAppName(plugin, syncRel);
+    const revealed = await client.revealText({ appName, path: syncRel, sanitizedText: localBuf.toString('utf8') });
+    if (!revealed || typeof revealed.text !== 'string') {
+        throw new Error('Wiki helper did not return revealed text.');
+    }
+
+    const unresolvedPlaceholders = Array.isArray(revealed.unresolvedPlaceholders)
+        ? revealed.unresolvedPlaceholders
+        : [];
+
+    const remoteBuf = Buffer.from(revealed.text, 'utf8');
+    const sanitized = await client.sanitizeNote({ appName, path: syncRel, rawMarkdown: revealed.text });
+    if (!sanitized || typeof sanitized.sanitizedMarkdown !== 'string') {
+        throw new Error('Wiki helper did not return sanitized Markdown.');
+    }
+
+    const rawContentHash = typeof sanitized.rawContentHash === 'string'
+        ? sanitized.rawContentHash
+        : sha256Buffer(remoteBuf);
+
+    return {
+        remoteBuf,
+        canonicalBuf: Buffer.from(sanitized.sanitizedMarkdown, 'utf8'),
+        unresolvedPlaceholders,
+        sanitizedMarkdown: sanitized.sanitizedMarkdown,
+        rawContentHash,
+    };
+}
+
 async function importOneFile(plugin, engine, sourceFile, relativeTargetDir) {
     const resolvedSourcePath = resolveImportSourcePath(sourceFile);
     const ext = path.extname(resolvedSourcePath).toLowerCase();
@@ -2440,7 +2849,9 @@ async function importOneFile(plugin, engine, sourceFile, relativeTargetDir) {
 
     const body = convertWithPythonMarkItDown(importExecutionPath(resolvedSourcePath, engine), engine);
     const content = buildMarkdownFrontmatter(toWindowsPathIfPossible(resolvedSourcePath), ext, body);
-    fs.writeFileSync(targetPath, content, 'utf8');
+    const syncRel = path.relative(plugin.syncDir(), targetPath).split(path.sep).join('/');
+    const sanitizedContent = await sanitizeImportedMarkdown(plugin, syncRel, content);
+    fs.writeFileSync(targetPath, sanitizedContent, 'utf8');
     return targetPath;
 }
 
@@ -2674,6 +3085,100 @@ class WikiSettingTab extends PluginSettingTab {
                 await p.saveSettings();
             }));
 
+        el.createEl('h3', { text: 'Privacy Helper' });
+        new Setting(el)
+            .setName('Enable privacy helper')
+            .setDesc('Routes future sanitization, reveal, and retrieval calls through the local helper.')
+            .addToggle(t => t.setValue(s.privacyHelperEnabled).onChange(async v => {
+                s.privacyHelperEnabled = v;
+                await p.saveSettings();
+            }));
+        new Setting(el)
+            .setName('Start helper automatically')
+            .setDesc('Starts the shipped local helper on desktop plugin load when privacy helper mode is enabled.')
+            .addToggle(t => t.setValue(s.privacyHelperAutoStart).onChange(async v => {
+                s.privacyHelperAutoStart = v;
+                await p.saveSettings();
+            }));
+        new Setting(el)
+            .setName('Helper URL')
+            .setDesc('Local HTTP endpoint for the privacy and retrieval helper.')
+            .addText(t => { t.inputEl.style.width = '100%'; bind('privacyHelperUrl', t); });
+        new Setting(el)
+            .setName('Helper dependencies')
+            .setDesc('Install or update the Python dependencies (presidio, spaCy, markitdown) into an isolated environment.')
+            .addButton(btn => btn
+                .setButtonText('Install / Update')
+                .onClick(async () => {
+                    if (!p.settings.privacyHelperEnabled) {
+                        new Notice('Enable the privacy helper first.', 5000);
+                        return;
+                    }
+                    const helperDir = p.helperDir();
+                    if (!fs.existsSync(path.join(helperDir, 'requirements.txt'))) {
+                        new Notice('Helper bundle not found — run npm run build first.', 8000);
+                        return;
+                    }
+                    const runtime = detectHelperPythonRuntime();
+                    if (!runtime.available) {
+                        new Notice('Python 3.11+ not found on PATH. Install Python and try again.', 8000);
+                        return;
+                    }
+                    if (!venvNeedsUpdate(helperDir)) {
+                        new Notice('Wiki helper dependencies are already up to date.', 5000);
+                        return;
+                    }
+                    try {
+                        await ensureHelperVenv(helperDir, runtime, { showNotice: true });
+                        new Notice('Wiki helper dependencies installed. Restart the helper to apply.', 6000);
+                    } catch (err) {
+                        new Notice(`Install failed: ${err.message}`, 10000);
+                    }
+                }));
+        new Setting(el)
+            .setName('Helper control')
+            .setDesc('Start the helper process or check its current status.')
+            .addButton(btn => btn
+                .setButtonText('Start')
+                .onClick(async () => {
+                    if (!p.settings.privacyHelperEnabled) {
+                        new Notice('Enable the privacy helper before starting.', 6000);
+                        return;
+                    }
+                    await p.startPrivacyHelperImpl({ showNotice: true });
+                }))
+            .addButton(btn => btn
+                .setButtonText('Check')
+                .onClick(async () => {
+                    const helperDir = p.helperDir();
+                    const lines = [];
+
+                    if (!fs.existsSync(path.join(helperDir, 'requirements.txt'))) {
+                        lines.push('Deps: bundle missing — run npm run build');
+                    } else if (venvNeedsUpdate(helperDir)) {
+                        lines.push('Deps: not installed — click Install / Update');
+                    } else {
+                        lines.push('Deps: venv up to date');
+                    }
+
+                    try {
+                        const result = await (p.wikiRagClient || new WikiRagClient(p.settings)).health();
+                        const anon = result?.anonymizerActive;
+                        if (anon === undefined) {
+                            lines.push('Helper: running (restart helper to refresh status)');
+                        } else {
+                            lines.push('Helper: running');
+                            lines.push(anon === 'presidio'
+                                ? 'Anonymizer: presidio (PII detection active)'
+                                : 'Anonymizer: fake — PII detection inactive, restart helper after installing deps');
+                        }
+                    } catch {
+                        lines.push('Helper: not running — click Start');
+                    }
+
+                    new Notice(lines.join('\n'), 10000);
+                }));
+
         el.createEl('h3', { text: 'Import' });
         new Setting(el)
             .setName('Detected import engine')
@@ -2769,7 +3274,7 @@ function setupTemplateNewPOC(plugin) {
         for (const item of v) out += `- "${String(item).replace(/"/g, '\\"')}"\n`;
       } else if (typeof v === "boolean") {
         out += `${k}: ${v}\n`;
-      } else if (v == null || v === "") {
+      } else if (v === null || v === undefined || v === "") {
         out += `${k}: ""\n`;
       } else {
         out += `${k}: "${String(v).replace(/"/g, '\\"')}"\n`;
@@ -2892,8 +3397,10 @@ function setupTemplateNewPOC(plugin) {
     for (const c of folder.children) {
       if (c instanceof TFile && (c.basename === "_template" || c.basename === "template")) templates.push(c);
     }
-    const tplSub = folder.children.find(c => c instanceof TFolder && c.name === "templates");
-    if (tplSub) for (const c of tplSub.children) if (c instanceof TFile && c.extension === "md") templates.push(c);
+    const tplSubs = folder.children.filter(c => c instanceof TFolder && (c.name === "templates" || c.name === "_templates"));
+    for (const tplSub of tplSubs) {
+      for (const c of tplSub.children) if (c instanceof TFile && c.extension === "md") templates.push(c);
+    }
     return { targetFolder: folder, templates };
   }
 
@@ -2925,232 +3432,6 @@ function setupTemplateNewPOC(plugin) {
 // ============================================================================
 
 
-// ============================================================================
-// POC: Inline wiki-query (SQL against the synced DB)
-// ============================================================================
-function setupWikiQueryPOC(plugin) {
-  // Translate `FROM oncall/contacts` → `FROM (SELECT * FROM wiki.oncall
-  // WHERE filename LIKE 'contacts/%' AND filetype='file') AS oncall`
-  // so downstream WHERE/SELECT can reference `headers`, `title`, etc. naturally.
-  function translateWikiPaths(sql) {
-    return sql.replace(
-      /(\bFROM\s+|\bJOIN\s+)([a-zA-Z_][\w]*)(?:\/([a-zA-Z0-9_.\/-]+))?/gi,
-      (_m, verb, app, subpath) => {
-        const table = `wiki.${app}`;
-        if (!subpath) return `${verb}${table}`;
-        const safe = subpath.replace(/'/g, "''");
-        return `${verb}(SELECT * FROM ${table} WHERE filename LIKE '${safe}/%' AND filetype = 'file') AS ${app}`;
-      }
-    );
-  }
-
-  const BASE_COLS = new Set([
-    "id", "filename", "filetype", "title", "author", "body",
-    "encoding", "created_at", "modified_at", "headers"
-  ]);
-
-  const SQL_KEYWORDS = new Set([
-    "select","from","where","and","or","not","in","is","like","ilike","between",
-    "order","by","group","having","limit","offset","asc","desc","as","join","on",
-    "left","right","inner","outer","full","cross","case","when","then","else","end",
-    "distinct","all","true","false","null","exists","any","some",
-    "count","sum","avg","min","max","string_agg","array_agg"
-  ]);
-
-  const WIKI_QUERY_FORBIDDEN_KEYWORDS = [
-    "ALTER", "ANALYZE", "CALL", "COMMENT", "COMMIT", "COPY", "CREATE", "DELETE",
-    "DROP", "EXECUTE", "GRANT", "INSERT", "LISTEN", "LOCK", "MERGE", "NOTIFY",
-    "REFRESH", "REINDEX", "REVOKE", "ROLLBACK", "SET", "TRUNCATE", "UNLISTEN",
-    "UPDATE", "VACUUM"
-  ];
-
-  function maskSqlLiteralsAndComments(sql) {
-    let out = "";
-    let i = 0;
-    const mask = (text) => " ".repeat(text.length);
-    while (i < sql.length) {
-      const rest = sql.slice(i);
-      const dollar = rest.match(/^\$[A-Za-z_]\w*\$|^\$\$/);
-      if (dollar) {
-        const tag = dollar[0];
-        const end = sql.indexOf(tag, i + tag.length);
-        const n = end === -1 ? sql.length - i : end + tag.length - i;
-        out += mask(sql.slice(i, i + n));
-        i += n;
-        continue;
-      }
-      if (sql.startsWith("--", i)) {
-        const end = sql.indexOf("\n", i + 2);
-        const n = end === -1 ? sql.length - i : end - i;
-        out += mask(sql.slice(i, i + n));
-        i += n;
-        continue;
-      }
-      if (sql.startsWith("/*", i)) {
-        const end = sql.indexOf("*/", i + 2);
-        const n = end === -1 ? sql.length - i : end + 2 - i;
-        out += mask(sql.slice(i, i + n));
-        i += n;
-        continue;
-      }
-      const quote = sql[i];
-      if (quote === "'" || quote === '"') {
-        const start = i;
-        i += 1;
-        while (i < sql.length) {
-          if (sql[i] === quote) {
-            if (sql[i + 1] === quote) {
-              i += 2;
-              continue;
-            }
-            i += 1;
-            break;
-          }
-          i += 1;
-        }
-        out += mask(sql.slice(start, i));
-        continue;
-      }
-      out += sql[i];
-      i += 1;
-    }
-    return out;
-  }
-
-  function assertSafeWikiQuery(sql) {
-    const masked = maskSqlLiteralsAndComments(String(sql || ""));
-    const withoutTrailingSemicolon = masked.replace(/;\s*$/, "");
-    if (withoutTrailingSemicolon.includes(";")) {
-      throw new Error("wiki-query allows one statement at a time.");
-    }
-    if (!/^\s*(SELECT|WITH)\b/i.test(withoutTrailingSemicolon)) {
-      throw new Error("wiki-query only allows read queries that start with SELECT or WITH.");
-    }
-    const forbidden = WIKI_QUERY_FORBIDDEN_KEYWORDS.find((kw) => new RegExp(`\\b${kw}\\b`, "i").test(masked));
-    if (forbidden) {
-      throw new Error(`wiki-query blocked unsafe SQL keyword: ${forbidden}`);
-    }
-  }
-
-  function splitTopLevel(s, sep) {
-    const out = []; let depth = 0, cur = "", inStr = false, q = "";
-    for (const ch of s) {
-      if (inStr) { cur += ch; if (ch === q) inStr = false; continue; }
-      if (ch === "'" || ch === '"') { inStr = true; q = ch; cur += ch; continue; }
-      if (ch === "(") depth++; else if (ch === ")") depth--;
-      if (ch === sep && depth === 0) { out.push(cur); cur = ""; continue; }
-      cur += ch;
-    }
-    if (cur.trim()) out.push(cur);
-    return out;
-  }
-
-  function isBareIdent(tok) {
-    return /^[a-zA-Z_]\w*$/.test(tok) && !SQL_KEYWORDS.has(tok.toLowerCase());
-  }
-
-  // SELECT bare-ident  →  headers->'ident' AS ident  (unless base column)
-  function rewriteSelectList(sql) {
-    return sql.replace(/\bSELECT\b([\s\S]+?)\bFROM\b/i, (_, list) => {
-      const cols = splitTopLevel(list, ",").map(raw => {
-        const t = raw.trim();
-        if (!t || t === "*") return t;
-        if (/[()]|->|\s+AS\s+/i.test(t)) return t;                         // expression, leave alone
-        if (!isBareIdent(t)) return t;
-        if (BASE_COLS.has(t.toLowerCase())) return t;
-        return `headers->'${t}' AS ${t}`;
-      });
-      return `SELECT ${cols.join(", ")} FROM`;
-    });
-  }
-
-  // WHERE bare-ident OP value  →  headers->>'ident' OP value
-  // WHERE bare-ident CONTAINS 'x'  →  headers->'ident' ? 'x'
-  function rewritePredicates(sql) {
-    return sql.replace(
-      /\b([a-zA-Z_]\w*)\s*(=|!=|<>|<=|>=|<|>|\bLIKE\b|\bILIKE\b|\bIN\b|\bCONTAINS\b)/gi,
-      (m, col, op) => {
-        const lower = col.toLowerCase();
-        if (BASE_COLS.has(lower) || SQL_KEYWORDS.has(lower)) return m;
-        if (op.toUpperCase() === "CONTAINS") return `headers->'${col}' ?`;
-        return `headers->>'${col}' ${op}`;
-      }
-    );
-  }
-
-  // After SQL returns, collapse jsonb arrays to "a; b; c" so single-col inline works.
-  function flattenRows(rows) {
-    return rows.map(r => {
-      const out = {};
-      for (const [k, v] of Object.entries(r)) {
-        if (Array.isArray(v)) out[k] = v.join("; ");
-        else if (v !== null && typeof v === "object") out[k] = JSON.stringify(v);
-        else out[k] = v;
-      }
-      return out;
-    });
-  }
-
-  async function runQuery(sql) {
-    assertSafeWikiQuery(sql);
-    const translated = rewritePredicates(rewriteSelectList(translateWikiPaths(sql)));
-    const rows = await plugin.contentStore.query(plugin.dbConnection, translated);
-    const flat = flattenRows(rows || []);
-    return { rows: flat, cols: flat[0] ? Object.keys(flat[0]) : [] };
-  }
-
-
-  function formatInline({ rows, cols }) {
-    if (!rows.length) return "(no rows)";
-    if (rows.length === 1 && cols.length === 1) return String(rows[0][cols[0]] ?? "");
-    if (cols.length === 1) return rows.map(r => r[cols[0]]).filter(v => v != null && v !== "").join("; ");
-    return rows.map(r => cols.map(c => r[c]).join(" | ")).join("; ");
-  }
-
-  function renderTable(el, { rows, cols }) {
-    if (!rows.length) { el.createEl("em", { text: "(no rows)" }); return; }
-    const tbl = el.createEl("table");
-    const thr = tbl.createEl("thead").createEl("tr");
-    cols.forEach(c => thr.createEl("th", { text: c }));
-    const tb = tbl.createEl("tbody");
-    for (const r of rows) {
-      const tr = tb.createEl("tr");
-      cols.forEach(c => tr.createEl("td", { text: r[c] == null ? "" : String(r[c]) }));
-    }
-  }
-
-  // Block form:  ```wiki-query  SELECT ...  ```
-  plugin.registerMarkdownCodeBlockProcessor("wiki-query", async (source, el) => {
-    try {
-      const result = await runQuery(source);
-      // single col → render as joined text so you can copy it out of reading view
-      if (result.cols.length <= 1) el.createSpan({ text: formatInline(result) });
-      else renderTable(el, result);
-    } catch (err) {
-      el.createEl("pre", { text: `Query error: ${err.message}` });
-    }
-  });
-
-  // Inline form:  `q: SELECT ...`
-  plugin.registerMarkdownPostProcessor(async (el) => {
-    const codes = Array.from(el.querySelectorAll("code"));
-    for (const code of codes) {
-      const text = code.textContent || "";
-      if (!text.startsWith("q:")) continue;
-      try {
-        const result = await runQuery(text.slice(2).trim());
-        const span = document.createElement("span");
-        span.textContent = formatInline(result);
-        code.replaceWith(span);
-      } catch (err) {
-        code.textContent = `[query error: ${err.message}]`;
-      }
-    }
-  });
-}
-// ============================================================================
-
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Plugin Lifecycle, Commands, and Sync Management
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3159,7 +3440,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
 
     async onload() {
         await this.loadSettings();
-        this.importEngine = detectImportEngine();
+        this.importEngine = detectImportEngine(this.helperDir());
         this.contentStore = CONTENT_STORE;
         this.lastError = null;
         this.reviewRequired = false;
@@ -3185,8 +3466,11 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this.remoteNotificationSeq = 0;
         this._remoteListenerReconnectTimer = null;
         this._recomputeTimer = null;
+        this._privacyHelperStarting = null;
         this._connecting = false;
         this.remoteAppCache = null;
+        this.privacyHelperProcess = null;
+        this.privacyHelperLaunchUrl = '';
 
         this.addSettingTab(new WikiSettingTab(this.app, this));
         this.connectStatusBarController = new WikiConnectStatusBarController(this);
@@ -3225,7 +3509,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this.registerCommands();
         this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => this.handleFileMenu(menu, file)));
         setupTemplateNewPOC(this);
-        setupWikiQueryPOC(this)
+        void this.startPrivacyHelper();
         this.recomputeState();
         this.recomputeConnectionState();
         if (this.settings.autoSync && this.isCloned()) void this.doSync();
@@ -3235,6 +3519,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
         if (this._recomputeTimer) clearTimeout(this._recomputeTimer);
         if (this._remoteListenerReconnectTimer) clearTimeout(this._remoteListenerReconnectTimer);
         this.disconnectDatabaseSync();
+        this.stopPrivacyHelper();
         if (this._style) this._style.remove();
         if (this._highlightStyle) this._highlightStyle.remove();
         if (this.connectStatusBarController) this.connectStatusBarController.dispose();
@@ -3249,6 +3534,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this.addCommand({ id: 'wiki-pull', name: 'Pull wiki changes', callback: () => this.doPull() });
         this.addCommand({ id: 'wiki-push', name: 'Push wiki changes', callback: () => this.doPush() });
         this.addCommand({ id: 'wiki-sync', name: 'Sync wiki', callback: () => this.doSync() });
+        this.addCommand({ id: 'wiki-reveal-sensitive-values', name: 'Reveal sensitive values', callback: () => this.revealSensitiveValuesForActiveFile() });
         this.addCommand({ id: 'wiki-history', name: 'View wiki file history', callback: () => {
             const file = this.app.workspace.getActiveFile();
             if (!file) {
@@ -3285,6 +3571,10 @@ module.exports = class WikiSyncPlugin extends Plugin {
                 .setTitle('View wiki history')
                 .setIcon('history')
                 .onClick(() => new WikiHistoryModal(this.app, this, file).open()));
+            menu.addItem(item => item
+                .setTitle('Reveal sensitive values')
+                .setIcon('eye')
+                .onClick(() => void this.revealSensitiveValuesForActiveFile(file)));
         }
 
         addImportMenuItems(menu, file, this);
@@ -3325,7 +3615,143 @@ module.exports = class WikiSyncPlugin extends Plugin {
     syncDir() { return path.join(this.vaultPath(), this.settings.syncSubdir); }
     manifestPath() { return path.join(this.vaultPath(), this.manifest.dir, 'sync', 'manifest.json'); }
     templateDir() { return path.join(this.vaultPath(), this.manifest.dir, 'templates'); }
+    helperDir() { return path.join(this.vaultPath(), this.manifest.dir, 'wiki-helper'); }
     aiScaffoldProfile() { return getAiScaffoldProfile(this.settings.scaffoldProfile); }
+
+    privacyHelperEndpoint() {
+        return new url.URL(this.settings.privacyHelperUrl);
+    }
+
+    privacyHelperEnv() {
+        const endpoint = this.privacyHelperEndpoint();
+        if (endpoint.protocol !== 'http:') {
+            throw new Error('Auto-start only supports http:// helper URLs.');
+        }
+        const helperSrc = path.join(this.helperDir(), 'src');
+        const pythonPath = process.env.PYTHONPATH
+            ? `${helperSrc}${path.delimiter}${process.env.PYTHONPATH}`
+            : helperSrc;
+        return Object.assign({}, process.env, {
+            PYTHONPATH: pythonPath,
+            WIKI_HELPER_HOST: endpoint.hostname || '127.0.0.1',
+            WIKI_HELPER_PORT: endpoint.port || '80',
+        });
+    }
+
+    async startPrivacyHelper({ showNotice = false } = {}) {
+        if (!this.settings.privacyHelperEnabled || !this.settings.privacyHelperAutoStart) return false;
+        if (this.privacyHelperProcess && !this.privacyHelperProcess.killed) return true;
+        if (this._privacyHelperStarting) return this._privacyHelperStarting;
+
+        this._privacyHelperStarting = this.startPrivacyHelperImpl({ showNotice })
+            .finally(() => { this._privacyHelperStarting = null; });
+        return this._privacyHelperStarting;
+    }
+
+    async startPrivacyHelperImpl({ showNotice = false } = {}) {
+        try {
+            await this.wikiRagClient.health();
+            if (showNotice) new Notice('Wiki helper is already running.', 4000);
+            return true;
+        } catch {
+            // Start the shipped helper below.
+        }
+
+        const helperDir = this.helperDir();
+        const helperSrc = path.join(helperDir, 'src');
+        if (!fs.existsSync(path.join(helperSrc, 'wiki_helper', 'app.py'))) {
+            const message = `Wiki helper bundle not found at ${helperDir}`;
+            if (showNotice) new Notice(message, 8000);
+            else console.warn(`[Wiki Sync] ${message}`);
+            return false;
+        }
+
+        const runtime = detectHelperPythonRuntime();
+        if (!runtime.available) {
+            const message = 'Python 3.11+ is required to start the Wiki helper.';
+            if (showNotice) new Notice(message, 8000);
+            else console.warn(`[Wiki Sync] ${message}`);
+            return false;
+        }
+
+        let venvPython;
+        try {
+            venvPython = await ensureHelperVenv(helperDir, runtime, { showNotice });
+        } catch (err) {
+            const message = `Wiki helper dependency setup failed: ${err.message}`;
+            if (showNotice) new Notice(message, 8000);
+            else console.warn(`[Wiki Sync] ${message}`);
+            return false;
+        }
+        if (!venvPython) {
+            const message = 'Wiki helper requirements.txt not found in bundle.';
+            if (showNotice) new Notice(message, 8000);
+            else console.warn(`[Wiki Sync] ${message}`);
+            return false;
+        }
+
+        // Re-detect import engine now that venv is ready.
+        this.importEngine = detectImportEngine(helperDir);
+
+        const child = spawn(venvPython, ['-m', 'wiki_helper.app'], {
+            cwd: helperDir,
+            env: this.privacyHelperEnv(),
+            stdio: 'ignore',
+            windowsHide: true,
+        });
+        this.privacyHelperProcess = child;
+        this.privacyHelperLaunchUrl = this.settings.privacyHelperUrl;
+        child.on('exit', () => {
+            if (this.privacyHelperProcess === child) {
+                this.privacyHelperProcess = null;
+                this.privacyHelperLaunchUrl = '';
+            }
+        });
+        child.on('error', error => {
+            if (this.privacyHelperProcess === child) {
+                this.privacyHelperProcess = null;
+                this.privacyHelperLaunchUrl = '';
+            }
+            console.warn(`[Wiki Sync] Wiki helper failed to start: ${error.message}`);
+        });
+
+        const started = await this.waitForPrivacyHelperHealth(5000);
+        if (started) {
+            if (showNotice) new Notice('Wiki helper started.', 4000);
+            return true;
+        }
+
+        this.stopPrivacyHelper();
+        const message = 'Wiki helper did not become healthy after startup.';
+        if (showNotice) new Notice(message, 8000);
+        else console.warn(`[Wiki Sync] ${message}`);
+        return false;
+    }
+
+    async waitForPrivacyHelperHealth(timeoutMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            try {
+                await this.wikiRagClient.health();
+                return true;
+            } catch {
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+        }
+        return false;
+    }
+
+    stopPrivacyHelper() {
+        if (!this.privacyHelperProcess) return;
+        const child = this.privacyHelperProcess;
+        this.privacyHelperProcess = null;
+        this.privacyHelperLaunchUrl = '';
+        try {
+            child.kill();
+        } catch {
+            // Process may already be gone.
+        }
+    }
 
     currentDatabaseName() {
         if (this.settings.authMode === 'local') return this.settings.localDbName || '(not configured)';
@@ -3493,6 +3919,70 @@ module.exports = class WikiSyncPlugin extends Plugin {
             summary: this.lastConnectError || summarizeErrorMessage(this.lastConnectDiagnostic),
             details: this.lastConnectDiagnostic,
         }).open();
+    }
+
+    async revealSensitiveValuesForActiveFile(fileOverride = null) {
+        const file = fileOverride || this.app.workspace.getActiveFile();
+        if (!file) {
+            new Notice('No file open');
+            return;
+        }
+        if (!this.isSyncPath(file.path)) {
+            new Notice('Active file is not inside the wiki sync folder');
+            return;
+        }
+        if (!this.settings.privacyHelperEnabled) {
+            new Notice('Enable the privacy helper to reveal sensitive values.', 7000);
+            return;
+        }
+
+        if (this.settings.privacyHelperAutoStart) {
+            await this.startPrivacyHelper({ showNotice: false });
+        }
+
+        const syncRel = this.syncRelativePath(file.path);
+        if (syncRel === null) {
+            new Notice('Active file is not inside the wiki sync folder');
+            return;
+        }
+
+        let sanitizedText = '';
+        try {
+            sanitizedText = await this.app.vault.cachedRead(file);
+            const appName = importedAppName(this, syncRel);
+            const revealed = await this.wikiRagClient.revealText({
+                appName,
+                path: syncRel,
+                sanitizedText,
+            });
+            if (!revealed || typeof revealed.text !== 'string') {
+                throw new Error('Wiki helper did not return revealed text.');
+            }
+
+            const unresolvedPlaceholders = Array.isArray(revealed.unresolvedPlaceholders)
+                ? revealed.unresolvedPlaceholders
+                : [];
+            const summary = [
+                revealed.text === sanitizedText
+                    ? 'No placeholder substitutions were needed.'
+                    : 'Read-only preview. The vault file was not modified.',
+                unresolvedPlaceholders.length
+                    ? `${unresolvedPlaceholders.length} placeholder(s) could not be resolved and remain in the preview.`
+                    : 'The vault file was not modified.',
+            ].join(' ');
+
+            new WikiDiagnosticsModal(this.app, {
+                title: `Reveal Sensitive Values - ${path.basename(file.path)}`,
+                summary,
+                details: revealed.text,
+            }).open();
+
+            if (unresolvedPlaceholders.length) {
+                console.warn('[Wiki Sync] Unresolved placeholders during reveal:', unresolvedPlaceholders);
+            }
+        } catch (error) {
+            new Notice(`Reveal failed: ${error.message}`, 8000);
+        }
     }
 
     setOperationError(message) {
@@ -5155,13 +5645,15 @@ $$ LANGUAGE plpgsql`;
             for (let i = 0; i < remoteFiles.length; i += 1) {
                 const rel = remoteFiles[i];
                 this.setProgress(this.formatProgress('Clone', i + 1, remoteFiles.length));
-                const buf = await this.readRemoteBuffer(rel);
+                const remoteBuf = await this.readRemoteBuffer(rel);
+                const vaultFile = await prepareRemoteBufferForVault(this, rel, remoteBuf);
                 const dst = this.localPathForSyncRel(rel);
                 fs.mkdirSync(path.dirname(dst), { recursive: true });
-                fs.writeFileSync(dst, buf);
+                fs.writeFileSync(dst, vaultFile.buffer);
+                await indexPreparedVaultBuffer(this, rel, vaultFile);
                 manifest.entries[rel] = {
-                    hash: sha256Buffer(buf),
-                    size: buf.length,
+                    hash: vaultFile.hash,
+                    size: vaultFile.size,
                     pulledAt: new Date().toISOString(),
                 };
                 touched.push(path.posix.join(this.settings.syncSubdir, rel));
@@ -5207,11 +5699,13 @@ $$ LANGUAGE plpgsql`;
             const entry = manifest.entries[rel];
 
             if (remoteExists && !localExists) {
-                const buf = await this.readRemoteBuffer(rel);
+                const remoteBuf = await this.readRemoteBuffer(rel);
+                const vaultFile = await prepareRemoteBufferForVault(this, rel, remoteBuf);
                 const dst = this.localPathForSyncRel(rel);
                 fs.mkdirSync(path.dirname(dst), { recursive: true });
-                fs.writeFileSync(dst, buf);
-                manifest.entries[rel] = { hash: sha256Buffer(buf), size: buf.length, pulledAt: new Date().toISOString() };
+                fs.writeFileSync(dst, vaultFile.buffer);
+                await indexPreparedVaultBuffer(this, rel, vaultFile);
+                manifest.entries[rel] = { hash: vaultFile.hash, size: vaultFile.size, pulledAt: new Date().toISOString() };
                 touched.push(path.posix.join(this.settings.syncSubdir, rel));
                 pulled += 1;
                 continue;
@@ -5263,15 +5757,17 @@ $$ LANGUAGE plpgsql`;
             }
 
             const remoteBuf = await this.readRemoteBuffer(rel);
-            const remoteHash = sha256Buffer(remoteBuf);
+            const vaultFile = await prepareRemoteBufferForVault(this, rel, remoteBuf);
+            const remoteHash = vaultFile.hash;
 
             if (entry && entry.hash === remoteHash) continue;
 
             if (!localExists || !entry) {
                 const dst = this.localPathForSyncRel(rel);
                 fs.mkdirSync(path.dirname(dst), { recursive: true });
-                fs.writeFileSync(dst, remoteBuf);
-                manifest.entries[rel] = { hash: remoteHash, size: remoteBuf.length, pulledAt: new Date().toISOString() };
+                fs.writeFileSync(dst, vaultFile.buffer);
+                await indexPreparedVaultBuffer(this, rel, vaultFile);
+                manifest.entries[rel] = { hash: remoteHash, size: vaultFile.size, pulledAt: new Date().toISOString() };
                 touched.push(path.posix.join(this.settings.syncSubdir, rel));
                 pulled += 1;
                 continue;
@@ -5280,8 +5776,9 @@ $$ LANGUAGE plpgsql`;
             const localBuf = fs.readFileSync(this.localPathForSyncRel(rel));
             const localHash = sha256Buffer(localBuf);
             if (localHash === entry.hash) {
-                fs.writeFileSync(this.localPathForSyncRel(rel), remoteBuf);
-                manifest.entries[rel] = { hash: remoteHash, size: remoteBuf.length, pulledAt: new Date().toISOString() };
+                fs.writeFileSync(this.localPathForSyncRel(rel), vaultFile.buffer);
+                await indexPreparedVaultBuffer(this, rel, vaultFile);
+                manifest.entries[rel] = { hash: remoteHash, size: vaultFile.size, pulledAt: new Date().toISOString() };
                 touched.push(path.posix.join(this.settings.syncSubdir, rel));
                 pulled += 1;
                 continue;
@@ -5293,7 +5790,7 @@ $$ LANGUAGE plpgsql`;
                 leftLabel: 'Local',
                 rightLabel: 'Remote',
                 leftBuf: localBuf,
-                rightBuf: remoteBuf,
+                rightBuf: vaultFile.buffer,
                 actions: [
                     { label: 'Keep Local', value: 'keep-local' },
                     { label: 'Take Remote', value: 'take-remote', cta: true },
@@ -5305,8 +5802,9 @@ $$ LANGUAGE plpgsql`;
                 throw Object.assign(new Error('Pull cancelled during review.'), { code: 'CANCELLED' });
             }
             if (choice === 'take-remote') {
-                fs.writeFileSync(this.localPathForSyncRel(rel), remoteBuf);
-                manifest.entries[rel] = { hash: remoteHash, size: remoteBuf.length, pulledAt: new Date().toISOString() };
+                fs.writeFileSync(this.localPathForSyncRel(rel), vaultFile.buffer);
+                await indexPreparedVaultBuffer(this, rel, vaultFile);
+                manifest.entries[rel] = { hash: remoteHash, size: vaultFile.size, pulledAt: new Date().toISOString() };
                 touched.push(path.posix.join(this.settings.syncSubdir, rel));
                 pulled += 1;
             }
@@ -5394,8 +5892,28 @@ $$ LANGUAGE plpgsql`;
                     if (choice === 'keep-remote') continue;
                 }
 
-                const storedBuf = await this.writeRemoteBuffer(rel, localBuf);
-                const canonicalBuf = Buffer.isBuffer(storedBuf) ? storedBuf : localBuf;
+                const pushPrep = await prepareLocalBufferForPush(this, rel, localBuf);
+                if (pushPrep.unresolvedPlaceholders.length) {
+                    const unresolvedChoice = await this.reviewConflict({
+                        title: `Push blocked — ${rel}`,
+                        message: `${pushPrep.unresolvedPlaceholders.length} placeholder(s) could not be resolved. Pushing would write unresolved placeholders to the remote.`,
+                        leftLabel: 'Local',
+                        rightLabel: 'Unresolved',
+                        leftBuf: localBuf,
+                        rightBuf: Buffer.from(pushPrep.unresolvedPlaceholders.join('\n'), 'utf8'),
+                        actions: [
+                            { label: 'Skip File', value: 'keep-remote' },
+                            { label: 'Cancel Push', value: 'cancel' },
+                        ],
+                    });
+                    if (unresolvedChoice === 'cancel') {
+                        this.reviewRequired = true;
+                        throw Object.assign(new Error('Push cancelled: unresolved placeholders.'), { code: 'CANCELLED' });
+                    }
+                    continue;
+                }
+                const storedBuf = await this.writeRemoteBuffer(rel, pushPrep.remoteBuf);
+                const canonicalBuf = pushPrep.canonicalBuf || (Buffer.isBuffer(storedBuf) ? storedBuf : localBuf);
                 if (!canonicalBuf.equals(localBuf)) {
                     fs.writeFileSync(this.localPathForSyncRel(rel), canonicalBuf);
                     rewrittenLocalPaths.push(path.posix.join(this.settings.syncSubdir, rel));
@@ -5405,6 +5923,7 @@ $$ LANGUAGE plpgsql`;
                     size: canonicalBuf.length,
                     pulledAt: new Date().toISOString(),
                 };
+                await indexPreparedVaultBuffer(this, rel, pushPrep);
                 if (appName) touchedApps.add(appName);
                 if (remoteSeq) this.clearTrackedRemoteFile(rel, remoteSeq);
                 pushed += 1;
@@ -5557,6 +6076,7 @@ $$ LANGUAGE plpgsql`;
         const rawSettings = await this.loadData();
         const { settings } = normalizeSettings(rawSettings);
         this.settings = settings;
+        this.wikiRagClient = new WikiRagClient(this.settings);
 
         const persistedSettings = buildPersistedSettings(this.settings);
         if (JSON.stringify(rawSettings || {}) !== JSON.stringify(persistedSettings)) {
@@ -5568,6 +6088,7 @@ $$ LANGUAGE plpgsql`;
         const previousTargetHash = this.settings ? this.currentManifestTargetHash() : '';
         const { settings, strippedLocalConnPassword } = normalizeSettings(this.settings);
         this.settings = settings;
+        this.wikiRagClient = new WikiRagClient(this.settings);
         const nextTargetHash = this.currentManifestTargetHash();
         const targetChanged = !!previousTargetHash && previousTargetHash !== nextTargetHash;
         if (targetChanged) {
@@ -5583,6 +6104,14 @@ $$ LANGUAGE plpgsql`;
         }
         if (targetChanged) {
             new Notice('Wiki Sync connection target changed. Clone the current wiki before syncing.', 8000);
+        }
+        if (!this.settings.privacyHelperEnabled || !this.settings.privacyHelperAutoStart) {
+            this.stopPrivacyHelper();
+        } else {
+            if (this.privacyHelperProcess && this.privacyHelperLaunchUrl !== this.settings.privacyHelperUrl) {
+                this.stopPrivacyHelper();
+            }
+            void this.startPrivacyHelper();
         }
         this.recomputeState();
     }
