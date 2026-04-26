@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wiki-helper"
+version = "0.1.0"
+description = "Local privacy and retrieval helper for Wiki Sync."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+wiki-helper = "wiki_helper.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
