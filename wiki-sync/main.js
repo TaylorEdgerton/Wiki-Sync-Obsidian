@@ -951,6 +951,22 @@ function buildLocalConnectionString(settings) {
     return `postgres://${encodeURIComponent(user)}@${hostPart}${portPart}/${encodeURIComponent(database)}`;
 }
 
+function buildPostgresConnectionUrl(options = {}) {
+    const user = typeof options.user === 'string' ? options.user.trim() : '';
+    const host = typeof options.host === 'string' ? options.host.trim() : '';
+    const database = typeof options.database === 'string' ? options.database.trim() : '';
+    if (!user || !host || !database) return '';
+
+    const parsed = new url.URL('postgres://localhost');
+    parsed.username = user;
+    if (typeof options.password === 'string' && options.password) parsed.password = options.password;
+    parsed.hostname = host;
+    if (options.port) parsed.port = String(options.port);
+    parsed.pathname = `/${database}`;
+    if (options.ssl === false) parsed.searchParams.set('sslmode', 'disable');
+    return parsed.toString();
+}
+
 function formatLocalDatabaseTarget(settings) {
     const user = typeof settings.localDbUser === 'string' ? settings.localDbUser.trim() : '';
     const host = typeof settings.localDbHost === 'string' ? settings.localDbHost.trim() : '';
@@ -989,6 +1005,14 @@ function normalizeHttpEndpoint(value, fallback) {
     try {
         const parsed = new url.URL(raw);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fallback;
+        if (!parsed.port) {
+            try {
+                const fallbackUrl = new url.URL(fallback);
+                parsed.port = fallbackUrl.port || (parsed.protocol === 'https:' ? '443' : '80');
+            } catch {
+                parsed.port = parsed.protocol === 'https:' ? '443' : '80';
+            }
+        }
         parsed.hash = '';
         return parsed.toString().replace(/\/+$/, '');
     } catch (_error) {
@@ -1565,6 +1589,167 @@ class WikiDiagnosticsModal extends Modal {
             area.focus();
             area.setSelectionRange(0, 0);
         }, 30);
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+function collectRevealHighlightRanges(text, sensitiveValues = [], unresolvedPlaceholders = []) {
+    const ranges = [];
+    const addMatches = (needle, kind, label) => {
+        if (!needle || typeof needle !== 'string') return;
+        let start = 0;
+        while (start < text.length) {
+            const index = text.indexOf(needle, start);
+            if (index === -1) break;
+            ranges.push({ start: index, end: index + needle.length, kind, label });
+            start = index + Math.max(needle.length, 1);
+        }
+    };
+
+    for (const item of sensitiveValues || []) {
+        const entityType = typeof item?.entityType === 'string' && item.entityType
+            ? item.entityType
+            : 'Sensitive';
+        addMatches(item?.text, 'sensitive', entityType);
+    }
+    for (const placeholder of unresolvedPlaceholders || []) {
+        addMatches(placeholder, 'unresolved', 'Unresolved placeholder');
+    }
+
+    const accepted = [];
+    for (const range of ranges.sort((left, right) => left.start - right.start || right.end - left.end)) {
+        if (range.end <= range.start) continue;
+        if (accepted.some(item => range.start < item.end && item.start < range.end)) continue;
+        accepted.push(range);
+    }
+    return accepted;
+}
+
+class WikiRevealPreviewModal extends Modal {
+    constructor(app, { title, summary, text, sensitiveValues, unresolvedPlaceholders }) {
+        super(app);
+        this.title = title;
+        this.summary = summary;
+        this.text = text || '';
+        this.sensitiveValues = Array.isArray(sensitiveValues) ? sensitiveValues : [];
+        this.unresolvedPlaceholders = Array.isArray(unresolvedPlaceholders) ? unresolvedPlaceholders : [];
+        this.previewEl = null;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        this.modalEl.style.width = 'min(1100px, 92vw)';
+        this.modalEl.style.maxWidth = '1100px';
+
+        contentEl.createEl('h3', { text: this.title });
+        if (this.summary) {
+            contentEl.createEl('p', {
+                text: this.summary,
+                cls: 'setting-item-description',
+            });
+        }
+
+        const toolbar = contentEl.createDiv();
+        toolbar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0;';
+
+        let statsText = `${this.sensitiveValues.length} sensitive value${this.sensitiveValues.length === 1 ? '' : 's'} highlighted`;
+        const stats = toolbar.createEl('div', {
+            text: statsText,
+            cls: 'setting-item-description',
+        });
+        if (this.unresolvedPlaceholders.length) {
+            statsText = `${statsText} - ${this.unresolvedPlaceholders.length} unresolved placeholder${this.unresolvedPlaceholders.length === 1 ? '' : 's'}`;
+            stats.setText(statsText);
+        }
+
+        const actions = toolbar.createDiv();
+        actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;';
+
+        const markButton = actions.createEl('button', { text: 'Mark Selection Sensitive' });
+        markButton.addEventListener('click', () => this.markSelectionSensitivePrototype());
+
+        const copyButton = actions.createEl('button', { text: 'Copy Preview' });
+        copyButton.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(this.text);
+                new Notice('Reveal preview copied.', 4000);
+            } catch {
+                new Notice('Copy failed.', 6000);
+            }
+        });
+
+        this.previewEl = contentEl.createDiv();
+        this.previewEl.tabIndex = 0;
+        this.previewEl.style.cssText = [
+            'max-height:min(70vh, 760px)',
+            'overflow:auto',
+            'background:var(--background-primary)',
+            'border:1px solid var(--background-modifier-border)',
+            'border-radius:8px',
+            'padding:16px',
+            'font-family:var(--font-monospace)',
+            'font-size:13px',
+            'line-height:1.55',
+            'white-space:pre-wrap',
+            'word-break:break-word',
+            'user-select:text',
+        ].join(';');
+        this.previewEl.addEventListener('contextmenu', event => this.openSelectionMenu(event));
+        this.renderPreview();
+    }
+
+    renderPreview() {
+        this.previewEl.empty();
+        const ranges = collectRevealHighlightRanges(this.text, this.sensitiveValues, this.unresolvedPlaceholders);
+        let cursor = 0;
+        for (const range of ranges) {
+            if (range.start > cursor) {
+                this.previewEl.appendText(this.text.slice(cursor, range.start));
+            }
+            const mark = this.previewEl.createEl('mark');
+            mark.setText(this.text.slice(range.start, range.end));
+            mark.title = range.label;
+            mark.style.cssText = range.kind === 'unresolved'
+                ? 'background:rgba(255, 193, 7, 0.28);color:inherit;border-bottom:2px solid var(--text-warning);padding:0 2px;border-radius:3px;'
+                : 'background:rgba(214, 90, 90, 0.22);color:inherit;border-bottom:2px solid var(--text-accent);padding:0 2px;border-radius:3px;';
+            cursor = range.end;
+        }
+        if (cursor < this.text.length) {
+            this.previewEl.appendText(this.text.slice(cursor));
+        }
+    }
+
+    selectedPreviewText() {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0 || !this.previewEl) return '';
+        const range = selection.getRangeAt(0);
+        if (!this.previewEl.contains(range.commonAncestorContainer)) return '';
+        return selection.toString().trim();
+    }
+
+    markSelectionSensitivePrototype() {
+        const selected = this.selectedPreviewText();
+        if (!selected) {
+            new Notice('Select text in the preview first.', 5000);
+            return;
+        }
+        new Notice('Prototype only: custom privacy terms are not persisted yet.', 7000);
+        console.log('[Wiki Sync] Selected text for future privacy term:', selected);
+    }
+
+    openSelectionMenu(event) {
+        const selected = this.selectedPreviewText();
+        if (!selected) return;
+        event.preventDefault();
+        const menu = new Menu();
+        menu.addItem(item => item
+            .setTitle('Mark selection sensitive')
+            .setIcon('eye-off')
+            .onClick(() => this.markSelectionSensitivePrototype()));
+        menu.showAtMouseEvent(event);
     }
 
     onClose() {
@@ -2805,7 +2990,12 @@ async function prepareLocalBufferForPush(plugin, syncRel, localBuf) {
 
     const client = plugin.wikiRagClient || new WikiRagClient(plugin.settings);
     const appName = importedAppName(plugin, syncRel);
-    const revealed = await client.revealText({ appName, path: syncRel, sanitizedText: localBuf.toString('utf8') });
+    const revealed = await client.revealText({
+        appName,
+        path: syncRel,
+        sanitizedText: localBuf.toString('utf8'),
+        preferRawSource: false,
+    });
     if (!revealed || typeof revealed.text !== 'string') {
         throw new Error('Wiki helper did not return revealed text.');
     }
@@ -3471,6 +3661,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this.remoteAppCache = null;
         this.privacyHelperProcess = null;
         this.privacyHelperLaunchUrl = '';
+        this.privacyHelperLaunchDatabaseUrlHash = '';
 
         this.addSettingTab(new WikiSettingTab(this.app, this));
         this.connectStatusBarController = new WikiConnectStatusBarController(this);
@@ -3622,7 +3813,11 @@ module.exports = class WikiSyncPlugin extends Plugin {
         return new url.URL(this.settings.privacyHelperUrl);
     }
 
-    privacyHelperEnv() {
+    privacyHelperDatabaseUrl() {
+        return buildPostgresConnectionUrl(this.lastResolvedConnectionOptions || {});
+    }
+
+    privacyHelperEnv(databaseUrl = '') {
         const endpoint = this.privacyHelperEndpoint();
         if (endpoint.protocol !== 'http:') {
             throw new Error('Auto-start only supports http:// helper URLs.');
@@ -3631,28 +3826,56 @@ module.exports = class WikiSyncPlugin extends Plugin {
         const pythonPath = process.env.PYTHONPATH
             ? `${helperSrc}${path.delimiter}${process.env.PYTHONPATH}`
             : helperSrc;
-        return Object.assign({}, process.env, {
+        const env = Object.assign({}, process.env, {
             PYTHONPATH: pythonPath,
             WIKI_HELPER_HOST: endpoint.hostname || '127.0.0.1',
-            WIKI_HELPER_PORT: endpoint.port || '80',
+            WIKI_HELPER_PORT: endpoint.port || new url.URL(DEFAULT_SETTINGS.privacyHelperUrl).port || '8765',
         });
+        if (databaseUrl) env.WIKI_HELPER_DATABASE_URL = databaseUrl;
+        else delete env.WIKI_HELPER_DATABASE_URL;
+        return env;
     }
 
-    async startPrivacyHelper({ showNotice = false } = {}) {
+    async startPrivacyHelper({ showNotice = false, requireDatabase = false } = {}) {
         if (!this.settings.privacyHelperEnabled || !this.settings.privacyHelperAutoStart) return false;
-        if (this.privacyHelperProcess && !this.privacyHelperProcess.killed) return true;
         if (this._privacyHelperStarting) return this._privacyHelperStarting;
 
-        this._privacyHelperStarting = this.startPrivacyHelperImpl({ showNotice })
+        this._privacyHelperStarting = this.startPrivacyHelperImpl({ showNotice, requireDatabase })
             .finally(() => { this._privacyHelperStarting = null; });
         return this._privacyHelperStarting;
     }
 
-    async startPrivacyHelperImpl({ showNotice = false } = {}) {
+    async startPrivacyHelperImpl({ showNotice = false, requireDatabase = false } = {}) {
+        const databaseUrl = this.privacyHelperDatabaseUrl();
+        const databaseUrlHash = databaseUrl ? sha256Buffer(Buffer.from(databaseUrl, 'utf8')) : '';
+        if (requireDatabase && !databaseUrl) {
+            const message = 'Wiki helper needs an active database connection for DB-backed reveal.';
+            if (showNotice) new Notice(message, 8000);
+            else console.warn(`[Wiki Sync] ${message}`);
+            return false;
+        }
+
         try {
-            await this.wikiRagClient.health();
-            if (showNotice) new Notice('Wiki helper is already running.', 4000);
-            return true;
+            const health = await this.wikiRagClient.health();
+            if (requireDatabase && !health?.databaseConfigured) {
+                if (!this.privacyHelperProcess) {
+                    const message = 'A running wiki helper is not configured with database access.';
+                    if (showNotice) new Notice(message, 8000);
+                    else console.warn(`[Wiki Sync] ${message}`);
+                    return false;
+                }
+                this.stopPrivacyHelper();
+            } else if (
+                requireDatabase &&
+                this.privacyHelperProcess &&
+                this.privacyHelperLaunchDatabaseUrlHash &&
+                this.privacyHelperLaunchDatabaseUrlHash !== databaseUrlHash
+            ) {
+                this.stopPrivacyHelper();
+            } else {
+                if (showNotice) new Notice('Wiki helper is already running.', 4000);
+                return true;
+            }
         } catch {
             // Start the shipped helper below.
         }
@@ -3693,36 +3916,51 @@ module.exports = class WikiSyncPlugin extends Plugin {
         // Re-detect import engine now that venv is ready.
         this.importEngine = detectImportEngine(helperDir);
 
+        this.privacyHelperRecentLogs = [];
+
         const child = spawn(venvPython, ['-m', 'wiki_helper.app'], {
             cwd: helperDir,
-            env: this.privacyHelperEnv(),
-            stdio: 'ignore',
+            env: this.privacyHelperEnv(databaseUrl),
+            stdio: ['ignore', 'pipe', 'pipe'],
             windowsHide: true,
         });
         this.privacyHelperProcess = child;
         this.privacyHelperLaunchUrl = this.settings.privacyHelperUrl;
-        child.on('exit', () => {
+        this.privacyHelperLaunchDatabaseUrlHash = databaseUrlHash;
+        child.stdout?.on('data', chunk => this.recordPrivacyHelperOutput('stdout', chunk));
+        child.stderr?.on('data', chunk => this.recordPrivacyHelperOutput('stderr', chunk));
+        child.on('exit', (code, signal) => {
             if (this.privacyHelperProcess === child) {
                 this.privacyHelperProcess = null;
                 this.privacyHelperLaunchUrl = '';
+                this.privacyHelperLaunchDatabaseUrlHash = '';
+                const exitLabel = signal ? `signal ${signal}` : `code ${code ?? 0}`;
+                const summary = this.privacyHelperLogSummary();
+                console.warn(`[Wiki Sync] Wiki helper exited before becoming healthy (${exitLabel})${summary ? `\n${summary}` : ''}`);
             }
         });
         child.on('error', error => {
             if (this.privacyHelperProcess === child) {
                 this.privacyHelperProcess = null;
                 this.privacyHelperLaunchUrl = '';
+                this.privacyHelperLaunchDatabaseUrlHash = '';
             }
-            console.warn(`[Wiki Sync] Wiki helper failed to start: ${error.message}`);
+            const summary = this.privacyHelperLogSummary();
+            console.warn(`[Wiki Sync] Wiki helper failed to start: ${error.message}${summary ? `\n${summary}` : ''}`);
         });
 
-        const started = await this.waitForPrivacyHelperHealth(5000);
+        const started = await this.waitForPrivacyHelperHealth(15000);
         if (started) {
             if (showNotice) new Notice('Wiki helper started.', 4000);
             return true;
         }
 
         this.stopPrivacyHelper();
-        const message = 'Wiki helper did not become healthy after startup.';
+        const summary = this.privacyHelperLogSummary();
+        const message = summary
+            ? 'Wiki helper did not become healthy after startup. See console for helper output.'
+            : 'Wiki helper did not become healthy after startup.';
+        if (summary) console.warn(`[Wiki Sync] Recent wiki helper output:\n${summary}`);
         if (showNotice) new Notice(message, 8000);
         else console.warn(`[Wiki Sync] ${message}`);
         return false;
@@ -3735,13 +3973,33 @@ module.exports = class WikiSyncPlugin extends Plugin {
                 await this.wikiRagClient.health();
                 return true;
             } catch {
+                if (!this.privacyHelperProcess) return false;
                 await new Promise(resolve => setTimeout(resolve, 250));
             }
         }
         return false;
     }
 
+    recordPrivacyHelperOutput(source, chunk) {
+        if (!Array.isArray(this.privacyHelperRecentLogs)) this.privacyHelperRecentLogs = [];
+        const text = String(chunk || '').replace(/\r/g, '');
+        for (const rawLine of text.split('\n')) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            const entry = `[${source}] ${line}`;
+            this.privacyHelperRecentLogs.push(entry);
+            if (this.privacyHelperRecentLogs.length > 20) this.privacyHelperRecentLogs.shift();
+            console.log(`[Wiki Sync][helper] ${entry}`);
+        }
+    }
+
+    privacyHelperLogSummary() {
+        if (!Array.isArray(this.privacyHelperRecentLogs) || !this.privacyHelperRecentLogs.length) return '';
+        return this.privacyHelperRecentLogs.join('\n');
+    }
+
     stopPrivacyHelper() {
+        this.privacyHelperLaunchDatabaseUrlHash = '';
         if (!this.privacyHelperProcess) return;
         const child = this.privacyHelperProcess;
         this.privacyHelperProcess = null;
@@ -3936,10 +4194,6 @@ module.exports = class WikiSyncPlugin extends Plugin {
             return;
         }
 
-        if (this.settings.privacyHelperAutoStart) {
-            await this.startPrivacyHelper({ showNotice: false });
-        }
-
         const syncRel = this.syncRelativePath(file.path);
         if (syncRel === null) {
             new Notice('Active file is not inside the wiki sync folder');
@@ -3948,6 +4202,12 @@ module.exports = class WikiSyncPlugin extends Plugin {
 
         let sanitizedText = '';
         try {
+            if (this.settings.privacyHelperAutoStart) {
+                await this.ensureConnected();
+                const started = await this.startPrivacyHelper({ showNotice: false, requireDatabase: true });
+                if (!started) throw new Error('Wiki helper is not running with database access.');
+            }
+
             sanitizedText = await this.app.vault.cachedRead(file);
             const appName = importedAppName(this, syncRel);
             const revealed = await this.wikiRagClient.revealText({
@@ -3962,19 +4222,27 @@ module.exports = class WikiSyncPlugin extends Plugin {
             const unresolvedPlaceholders = Array.isArray(revealed.unresolvedPlaceholders)
                 ? revealed.unresolvedPlaceholders
                 : [];
+            const sensitiveValues = Array.isArray(revealed.sensitiveValues)
+                ? revealed.sensitiveValues
+                : [];
             const summary = [
                 revealed.text === sanitizedText
                     ? 'No placeholder substitutions were needed.'
-                    : 'Read-only preview. The vault file was not modified.',
+                    : 'Read-only revealed preview. The vault file was not modified.',
+                sensitiveValues.length
+                    ? `${sensitiveValues.length} sensitive value${sensitiveValues.length === 1 ? '' : 's'} highlighted.`
+                    : 'No sensitive values were highlighted.',
                 unresolvedPlaceholders.length
                     ? `${unresolvedPlaceholders.length} placeholder(s) could not be resolved and remain in the preview.`
                     : 'The vault file was not modified.',
             ].join(' ');
 
-            new WikiDiagnosticsModal(this.app, {
+            new WikiRevealPreviewModal(this.app, {
                 title: `Reveal Sensitive Values - ${path.basename(file.path)}`,
                 summary,
-                details: revealed.text,
+                text: revealed.text,
+                sensitiveValues,
+                unresolvedPlaceholders,
             }).open();
 
             if (unresolvedPlaceholders.length) {

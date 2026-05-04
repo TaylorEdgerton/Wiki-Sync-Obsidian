@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
 from .config import HelperConfig, load_config
+from .db import PostgresRawSourceReader, RawSourceReader
 from .embeddings import FakeEmbeddingProvider
-from .privacy import Detector, FakeDetector, InMemoryEntityMap, LocalXorCipher, PresidioDetector, reveal_text, sanitize_text
+from .privacy import Detector, FakeDetector, InMemoryEntityMap, LocalXorCipher, PLACEHOLDER_RE, PresidioDetector, reveal_text, sanitize_text
 from .search import InMemorySearchIndex, content_hash
 
 
@@ -39,6 +41,7 @@ class HelperState:
     entity_map: InMemoryEntityMap = field(default_factory=InMemoryEntityMap)
     cipher: LocalXorCipher = field(default_factory=LocalXorCipher)
     index: InMemorySearchIndex = field(default_factory=InMemorySearchIndex)
+    raw_source_reader: RawSourceReader | None = None
 
     @property
     def anonymizer_active(self) -> str:
@@ -131,12 +134,73 @@ def _index_note(payload: dict[str, Any], state: HelperState) -> dict[str, Any]:
     }
 
 
+def _sensitive_values_for_records(records: list[Any], state: HelperState) -> list[dict[str, str]]:
+    values: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for record in records:
+        key = str(getattr(record, "real_value_hash", "") or getattr(record, "placeholder", ""))
+        if not key or key in seen:
+            continue
+        try:
+            real_value = state.cipher.decrypt(record.real_value_ciphertext)
+        except Exception:
+            continue
+        seen.add(key)
+        values.append({
+            "text": real_value,
+            "placeholder": record.placeholder,
+            "entityType": record.entity_type,
+            "realValueHash": record.real_value_hash,
+        })
+    return values
+
+
+def _sensitive_values_for_reveal(sanitized_text: str, revealed_text: str, state: HelperState) -> list[dict[str, str]]:
+    records = []
+    for match in PLACEHOLDER_RE.finditer(sanitized_text):
+        record = state.entity_map.resolve(match.group(0))
+        if record:
+            records.append(record)
+
+    detected = sanitize_text(revealed_text, state.detector, state.entity_map, state.cipher)
+    records.extend(detected.entities)
+    return _sensitive_values_for_records(records, state)
+
+
 def _reveal_text(payload: dict[str, Any], state: HelperState) -> dict[str, Any]:
     sanitized = _required_string(payload, "sanitizedText")
+    app_name = payload.get("appName")
+    note_path = payload.get("path")
+    prefer_raw_source = payload.get("preferRawSource", True) is not False
+
+    if (
+        prefer_raw_source
+        and isinstance(app_name, str) and app_name
+        and isinstance(note_path, str) and note_path
+        and state.raw_source_reader
+    ):
+        try:
+            raw_text = state.raw_source_reader.read_note(app_name, note_path)
+        except Exception as error:
+            warnings.warn(
+                f"database-backed reveal unavailable for {app_name}/{note_path}: {error}",
+                stacklevel=2,
+            )
+        else:
+            if raw_text is not None:
+                return {
+                    "text": raw_text,
+                    "unresolvedPlaceholders": [],
+                    "sensitiveValues": _sensitive_values_for_reveal(sanitized, raw_text, state),
+                    "source": "rawSource",
+                }
+
     result = reveal_text(sanitized, state.entity_map, state.cipher)
     return {
         "text": result.text,
         "unresolvedPlaceholders": list(result.unresolved_placeholders),
+        "sensitiveValues": _sensitive_values_for_reveal(sanitized, result.text, state),
+        "source": "placeholderMap",
     }
 
 
@@ -144,6 +208,7 @@ def make_handler(config: HelperConfig, state: HelperState | None = None) -> type
     resolved_state = state or HelperState(
         detector=_build_detector(config),
         index=InMemorySearchIndex(FakeEmbeddingProvider(config.embedding_dimension)),
+        raw_source_reader=PostgresRawSourceReader(config.database_url) if config.database_url else None,
     )
 
     class WikiHelperHandler(BaseHTTPRequestHandler):

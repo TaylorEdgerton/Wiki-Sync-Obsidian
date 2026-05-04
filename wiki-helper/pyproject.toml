@@ -7,7 +7,9 @@ name = "wiki-helper"
 version = "0.1.0"
 description = "Local privacy and retrieval helper for Wiki Sync."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "psycopg[binary]>=3.2,<4",
+]
 
 [project.optional-dependencies]
 presidio = [
