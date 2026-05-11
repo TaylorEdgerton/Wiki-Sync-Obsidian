@@ -9,6 +9,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+from .privacy import (
+    EntityRecord,
+    PrivacyTerm,
+    ValueCipher,
+    normalize_entity_type,
+    normalize_policy_term,
+    placeholder_for_hash,
+    real_value_hash,
+)
+
 
 SCHEMA_DIR = Path(__file__).resolve().parents[2] / "schema"
 CONTENT_VIEW_SCHEMA = "public"
@@ -49,6 +59,15 @@ class RemoteAppMeta:
 class RawSourceReader(Protocol):
     def read_note(self, app_name: str, note_path: str) -> str | None:
         """Return the raw synced note text for an app/path pair when available."""
+
+
+def _connect_dict(database_url: str):
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise RuntimeError("psycopg is required for database-backed helper storage") from exc
+    return psycopg.connect(database_url, row_factory=dict_row)
 
 
 def _normalize_content_features(features: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -332,17 +351,191 @@ class PostgresRawSourceReader:
         return synthesize_document_markdown(app_meta.columns, values, app_meta.roles)
 
     def _fetchall(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        try:
-            import psycopg
-            from psycopg.rows import dict_row
-        except ImportError as exc:
-            raise RuntimeError("psycopg is required for database-backed reveal") from exc
-
-        with psycopg.connect(self.database_url, row_factory=dict_row) as connection:
+        with _connect_dict(self.database_url) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(sql, params)
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
+
+
+@dataclass
+class PostgresEntityMap:
+    database_url: str
+
+    def upsert(self, entity_type: str, real_value: str, cipher: ValueCipher) -> EntityRecord:
+        normalized_type = normalize_entity_type(entity_type)
+        real_hash = real_value_hash(normalized_type, real_value)
+        existing = self._record_by_hash(real_hash)
+        if existing:
+            return existing
+
+        ciphertext = cipher.encrypt(real_value)
+        with _connect_dict(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                for length in range(16, len(real_hash) + 1, 4):
+                    placeholder = placeholder_for_hash(normalized_type, real_hash, length)
+                    cursor.execute(
+                        """
+                        INSERT INTO wiki_private.entity_map (
+                            placeholder, entity_type, real_value_ciphertext, real_value_hash, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, now())
+                        ON CONFLICT DO NOTHING
+                        RETURNING placeholder, entity_type, real_value_ciphertext, real_value_hash
+                        """,
+                        [placeholder, normalized_type, ciphertext, real_hash],
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        connection.commit()
+                        return _entity_record_from_row(row)
+
+                    cursor.execute(
+                        """
+                        SELECT placeholder, entity_type, real_value_ciphertext, real_value_hash
+                        FROM wiki_private.entity_map
+                        WHERE real_value_hash = %s
+                        LIMIT 1
+                        """,
+                        [real_hash],
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        connection.commit()
+                        return _entity_record_from_row(row)
+            connection.commit()
+        raise RuntimeError("unable to allocate stable privacy placeholder")
+
+    def resolve(self, placeholder: str) -> EntityRecord | None:
+        with _connect_dict(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT placeholder, entity_type, real_value_ciphertext, real_value_hash
+                    FROM wiki_private.entity_map
+                    WHERE placeholder = %s
+                    LIMIT 1
+                    """,
+                    [placeholder],
+                )
+                row = cursor.fetchone()
+        return _entity_record_from_row(row) if row else None
+
+    def _record_by_hash(self, real_hash: str) -> EntityRecord | None:
+        with _connect_dict(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT placeholder, entity_type, real_value_ciphertext, real_value_hash
+                    FROM wiki_private.entity_map
+                    WHERE real_value_hash = %s
+                    LIMIT 1
+                    """,
+                    [real_hash],
+                )
+                row = cursor.fetchone()
+        return _entity_record_from_row(row) if row else None
+
+
+@dataclass
+class PostgresPrivacyPolicyStore:
+    database_url: str
+
+    def add_private_term(self, entity_type: str, term: str) -> PrivacyTerm:
+        normalized_type = normalize_entity_type(entity_type)
+        normalized_term = normalize_policy_term(term)
+        if not normalized_term:
+            raise ValueError("privacy term is empty")
+        value = str(term).strip()
+        with _connect_dict(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO wiki_private.privacy_terms (
+                        entity_type, term, normalized_term, updated_at
+                    )
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (entity_type, normalized_term)
+                    DO UPDATE SET term = EXCLUDED.term, updated_at = now()
+                    RETURNING entity_type, term
+                    """,
+                    [normalized_type, value, normalized_term],
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return PrivacyTerm(entity_type=str(row["entity_type"]), term=str(row["term"]))
+
+    def add_allowlist_term(self, term: str) -> str:
+        normalized_term = normalize_policy_term(term)
+        if not normalized_term:
+            raise ValueError("allowlist term is empty")
+        value = str(term).strip()
+        with _connect_dict(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO wiki_private.privacy_allowlist (term, normalized_term, updated_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (normalized_term)
+                    DO UPDATE SET term = EXCLUDED.term, updated_at = now()
+                    RETURNING term
+                    """,
+                    [value, normalized_term],
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return str(row["term"])
+
+    def private_terms(self) -> tuple[PrivacyTerm, ...]:
+        rows = self._fetchall(
+            """
+            SELECT entity_type, term
+            FROM wiki_private.privacy_terms
+            WHERE enabled
+            ORDER BY entity_type, normalized_term
+            """,
+            [],
+        )
+        return tuple(PrivacyTerm(entity_type=str(row["entity_type"]), term=str(row["term"])) for row in rows)
+
+    def allowlist_terms(self) -> tuple[str, ...]:
+        rows = self._fetchall(
+            """
+            SELECT term
+            FROM wiki_private.privacy_allowlist
+            WHERE enabled
+            ORDER BY normalized_term
+            """,
+            [],
+        )
+        return tuple(str(row["term"]) for row in rows)
+
+    def _fetchall(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        with _connect_dict(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+def _entity_record_from_row(row: Mapping[str, Any]) -> EntityRecord:
+    ciphertext = row["real_value_ciphertext"]
+    if isinstance(ciphertext, memoryview):
+        ciphertext = ciphertext.tobytes()
+    return EntityRecord(
+        placeholder=str(row["placeholder"]),
+        entity_type=str(row["entity_type"]),
+        real_value_ciphertext=bytes(ciphertext),
+        real_value_hash=str(row["real_value_hash"]),
+    )
+
+
+def bootstrap_schema(database_url: str) -> None:
+    with _connect_dict(database_url) as connection:
+        with connection.cursor() as cursor:
+            for statement in split_sql_statements(read_bootstrap_schema()):
+                cursor.execute(statement)
+        connection.commit()
 
 
 def read_bootstrap_schema() -> str:
@@ -369,4 +562,3 @@ def split_sql_statements(sql: str) -> list[str]:
     if tail:
         statements.append(tail)
     return statements
-

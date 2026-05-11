@@ -1,8 +1,10 @@
 import unittest
 
 from wiki_helper.privacy import (
+    CompositeDetector,
     FakeDetector,
     InMemoryEntityMap,
+    InMemoryPrivacyPolicy,
     LocalXorCipher,
     PLACEHOLDER_RE,
     reveal_text,
@@ -60,7 +62,44 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(revealed.text, "Host db01.internal restarted.")
         self.assertEqual(revealed.unresolved_placeholders, ())
 
+    def test_policy_terms_drive_sanitization(self):
+        policy = InMemoryPrivacyPolicy()
+        policy.add_private_term("system", "LogSafe")
+        detector = FakeDetector({
+            term.entity_type: [term.term]
+            for term in policy.private_terms()
+        })
+        entity_map = InMemoryEntityMap()
+
+        sanitized = sanitize_text("Open LogSafe.", detector, entity_map, LocalXorCipher("test-key"))
+
+        self.assertIn("[[PRIVATE:SYSTEM:", sanitized.text)
+
+    def test_allowlist_suppresses_matches(self):
+        entity_map = InMemoryEntityMap()
+        detector = FakeDetector({"person": ["Taylor"]})
+
+        sanitized = sanitize_text(
+            "Taylor should stay public.",
+            detector,
+            entity_map,
+            LocalXorCipher("test-key"),
+            allowlist_terms=("Taylor",),
+        )
+
+        self.assertEqual(sanitized.text, "Taylor should stay public.")
+        self.assertEqual(sanitized.entities, ())
+
+    def test_composite_detector_combines_matches(self):
+        detector = CompositeDetector((
+            FakeDetector({"person": ["Taylor"]}),
+            FakeDetector({"host": ["db01"]}),
+        ))
+
+        matches = detector.detect("Taylor owns db01.")
+
+        self.assertEqual({match.entity_type for match in matches}, {"PERSON", "HOST"})
+
 
 if __name__ == "__main__":
     unittest.main()
-

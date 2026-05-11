@@ -128,6 +128,68 @@ class AppTests(unittest.TestCase):
         self.assertEqual(revealed["source"], "placeholderMap")
         self.assertEqual(revealed["sensitiveValues"][0]["text"], "Taylor")
 
+    def test_privacy_term_persists_for_later_sanitization(self):
+        term_request = Request(
+            f"{self.base_url}/privacy-term",
+            data=json.dumps({
+                "term": "LogSafe",
+                "entityType": "system",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(term_request, timeout=2) as response:
+            term = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(term["action"], "private")
+        self.assertEqual(term["entityType"], "SYSTEM")
+
+        sanitize_request = Request(
+            f"{self.base_url}/sanitize-note",
+            data=json.dumps({
+                "appName": "wiki",
+                "path": "notes/logsafe.md",
+                "rawMarkdown": "Open LogSafe.",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(sanitize_request, timeout=2) as response:
+            sanitized = json.loads(response.read().decode("utf-8"))
+
+        self.assertIn("[[PRIVATE:SYSTEM:", sanitized["sanitizedMarkdown"])
+
+    def test_privacy_allowlist_suppresses_later_sanitization(self):
+        allow_request = Request(
+            f"{self.base_url}/privacy-term",
+            data=json.dumps({
+                "term": "Taylor",
+                "action": "allowlist",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(allow_request, timeout=2) as response:
+            allowed = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(allowed["action"], "allowlist")
+
+        sanitize_request = Request(
+            f"{self.base_url}/sanitize-note",
+            data=json.dumps({
+                "appName": "wiki",
+                "path": "notes/test.md",
+                "rawMarkdown": "Ask Taylor.",
+                "terms": {"person": ["Taylor"]},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(sanitize_request, timeout=2) as response:
+            sanitized = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(sanitized["sanitizedMarkdown"], "Ask Taylor.")
+
     def test_reveal_text_prefers_synced_raw_source(self):
         from wiki_helper.app import HelperState
 

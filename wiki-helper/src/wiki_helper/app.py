@@ -10,9 +10,22 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .config import HelperConfig, load_config
-from .db import PostgresRawSourceReader, RawSourceReader
+from .db import PostgresEntityMap, PostgresPrivacyPolicyStore, PostgresRawSourceReader, RawSourceReader, bootstrap_schema
 from .embeddings import FakeEmbeddingProvider
-from .privacy import Detector, FakeDetector, InMemoryEntityMap, LocalXorCipher, PLACEHOLDER_RE, PresidioDetector, reveal_text, sanitize_text
+from .privacy import (
+    CompositeDetector,
+    Detector,
+    EntityMap,
+    FakeDetector,
+    InMemoryEntityMap,
+    InMemoryPrivacyPolicy,
+    LocalXorCipher,
+    PLACEHOLDER_RE,
+    PresidioDetector,
+    PrivacyPolicy,
+    reveal_text,
+    sanitize_text,
+)
 from .search import InMemorySearchIndex, content_hash
 
 
@@ -38,7 +51,8 @@ def _build_detector(config: HelperConfig) -> Detector:
 @dataclass
 class HelperState:
     detector: Detector = field(default_factory=lambda: FakeDetector({}))
-    entity_map: InMemoryEntityMap = field(default_factory=InMemoryEntityMap)
+    entity_map: EntityMap = field(default_factory=InMemoryEntityMap)
+    privacy_policy: PrivacyPolicy = field(default_factory=InMemoryPrivacyPolicy)
     cipher: LocalXorCipher = field(default_factory=LocalXorCipher)
     index: InMemorySearchIndex = field(default_factory=InMemorySearchIndex)
     raw_source_reader: RawSourceReader | None = None
@@ -84,13 +98,46 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
     return value
 
 
+def _terms_dict_from_policy(policy: PrivacyPolicy) -> dict[str, list[str]]:
+    terms: dict[str, list[str]] = {}
+    for term in policy.private_terms():
+        terms.setdefault(term.entity_type, []).append(term.term)
+    return terms
+
+
+def _merge_terms(left: dict[str, list[str]], right: dict[str, Any]) -> dict[str, list[str]]:
+    merged = {entity_type: list(values) for entity_type, values in left.items()}
+    for entity_type, values in right.items():
+        if isinstance(values, str):
+            merged.setdefault(str(entity_type), []).append(values)
+            continue
+        if isinstance(values, list):
+            merged.setdefault(str(entity_type), []).extend(str(value) for value in values if value)
+    return merged
+
+
+def _detector_for_payload(payload: dict[str, Any], state: HelperState) -> Detector:
+    terms = _terms_dict_from_policy(state.privacy_policy)
+    payload_terms = payload.get("terms")
+    if isinstance(payload_terms, dict):
+        terms = _merge_terms(terms, payload_terms)
+    terms_detector = FakeDetector(terms)
+    if isinstance(state.detector, FakeDetector) and not getattr(state.detector, "terms", None):
+        return terms_detector
+    return CompositeDetector((state.detector, terms_detector))
+
+
 def _sanitize_note(payload: dict[str, Any], state: HelperState) -> dict[str, Any]:
     app_name = _required_string(payload, "appName")
     note_path = _required_string(payload, "path")
     raw_markdown = _required_string(payload, "rawMarkdown")
-    terms = payload.get("terms")
-    detector = FakeDetector(terms) if isinstance(terms, dict) else state.detector
-    sanitized = sanitize_text(raw_markdown, detector, state.entity_map, state.cipher)
+    sanitized = sanitize_text(
+        raw_markdown,
+        _detector_for_payload(payload, state),
+        state.entity_map,
+        state.cipher,
+        allowlist_terms=state.privacy_policy.allowlist_terms(),
+    )
     return {
         "appName": app_name,
         "path": note_path,
@@ -162,7 +209,13 @@ def _sensitive_values_for_reveal(sanitized_text: str, revealed_text: str, state:
         if record:
             records.append(record)
 
-    detected = sanitize_text(revealed_text, state.detector, state.entity_map, state.cipher)
+    detected = sanitize_text(
+        revealed_text,
+        _detector_for_payload({}, state),
+        state.entity_map,
+        state.cipher,
+        allowlist_terms=state.privacy_policy.allowlist_terms(),
+    )
     records.extend(detected.entities)
     return _sensitive_values_for_records(records, state)
 
@@ -204,12 +257,51 @@ def _reveal_text(payload: dict[str, Any], state: HelperState) -> dict[str, Any]:
     }
 
 
-def make_handler(config: HelperConfig, state: HelperState | None = None) -> type[BaseHTTPRequestHandler]:
-    resolved_state = state or HelperState(
+def _privacy_term(payload: dict[str, Any], state: HelperState) -> dict[str, Any]:
+    term = _required_string(payload, "term")
+    action = str(payload.get("action") or "private").strip().lower()
+    if action in {"allow", "allowlist", "public"}:
+        stored = state.privacy_policy.add_allowlist_term(term)
+        return {
+            "action": "allowlist",
+            "term": stored,
+        }
+
+    entity_type = str(payload.get("entityType") or payload.get("entity_type") or "PRIVATE")
+    stored = state.privacy_policy.add_private_term(entity_type, term)
+    return {
+        "action": "private",
+        "term": stored.term,
+        "entityType": stored.entity_type,
+    }
+
+
+def _build_state(config: HelperConfig) -> HelperState:
+    raw_source_reader = PostgresRawSourceReader(config.database_url) if config.database_url else None
+    if config.database_url:
+        try:
+            bootstrap_schema(config.database_url)
+            return HelperState(
+                detector=_build_detector(config),
+                entity_map=PostgresEntityMap(config.database_url),
+                privacy_policy=PostgresPrivacyPolicyStore(config.database_url),
+                index=InMemorySearchIndex(FakeEmbeddingProvider(config.embedding_dimension)),
+                raw_source_reader=raw_source_reader,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"database-backed privacy storage unavailable, falling back to in-memory privacy state: {exc}",
+                stacklevel=2,
+            )
+    return HelperState(
         detector=_build_detector(config),
         index=InMemorySearchIndex(FakeEmbeddingProvider(config.embedding_dimension)),
-        raw_source_reader=PostgresRawSourceReader(config.database_url) if config.database_url else None,
+        raw_source_reader=raw_source_reader,
     )
+
+
+def make_handler(config: HelperConfig, state: HelperState | None = None) -> type[BaseHTTPRequestHandler]:
+    resolved_state = state or _build_state(config)
 
     class WikiHelperHandler(BaseHTTPRequestHandler):
         server_version = "WikiHelper/0.1"
@@ -226,7 +318,7 @@ def make_handler(config: HelperConfig, state: HelperState | None = None) -> type
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
-            if path not in ROUTE_STUBS and path not in {"/sanitize-note", "/index-note"}:
+            if path not in ROUTE_STUBS and path not in {"/sanitize-note", "/index-note", "/privacy-term"}:
                 _send_json(self, 404, {"error": "not_found"})
                 return
             try:
@@ -240,6 +332,9 @@ def make_handler(config: HelperConfig, state: HelperState | None = None) -> type
                     return
                 if path == "/index-note":
                     _send_json(self, 200, _index_note(payload, resolved_state))
+                    return
+                if path == "/privacy-term":
+                    _send_json(self, 200, _privacy_term(payload, resolved_state))
                     return
                 if path == "/reveal-text":
                     _send_json(self, 200, _reveal_text(payload, resolved_state))

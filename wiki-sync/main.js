@@ -1170,6 +1170,10 @@ class WikiRagClient {
         return this.request('POST', 'reveal-text', payload);
     }
 
+    privacyTerm(payload) {
+        return this.request('POST', 'privacy-term', payload);
+    }
+
     searchWiki(payload) {
         return this.request('POST', 'search-wiki', payload);
     }
@@ -1220,7 +1224,7 @@ class WikiRagClient {
                     resolve(parsedBody);
                 });
             });
-            req.setTimeout(5000, () => req.destroy(new Error('Wiki helper request timed out.')));
+            req.setTimeout(30000, () => req.destroy(new Error('Wiki helper request timed out.')));
             req.on('error', reject);
             if (method !== 'GET') req.write(body);
             req.end();
@@ -1596,165 +1600,41 @@ class WikiDiagnosticsModal extends Modal {
     }
 }
 
-function collectRevealHighlightRanges(text, sensitiveValues = [], unresolvedPlaceholders = []) {
-    const ranges = [];
-    const addMatches = (needle, kind, label) => {
-        if (!needle || typeof needle !== 'string') return;
-        let start = 0;
-        while (start < text.length) {
-            const index = text.indexOf(needle, start);
-            if (index === -1) break;
-            ranges.push({ start: index, end: index + needle.length, kind, label });
-            start = index + Math.max(needle.length, 1);
-        }
-    };
+const PRIVATE_PLACEHOLDER_PATTERN = String.raw`PRIVATE:[A-Z0-9_]+:[A-F0-9]{12,64}`;
+const PRIVATE_PLACEHOLDER_TOKEN_RE = new RegExp(String.raw`\[\[${PRIVATE_PLACEHOLDER_PATTERN}\]\]|${PRIVATE_PLACEHOLDER_PATTERN}`, 'g');
+const PRIVATE_PLACEHOLDER_TEST_RE = new RegExp(PRIVATE_PLACEHOLDER_PATTERN);
 
-    for (const item of sensitiveValues || []) {
-        const entityType = typeof item?.entityType === 'string' && item.entityType
-            ? item.entityType
-            : 'Sensitive';
-        addMatches(item?.text, 'sensitive', entityType);
-    }
-    for (const placeholder of unresolvedPlaceholders || []) {
-        addMatches(placeholder, 'unresolved', 'Unresolved placeholder');
-    }
-
-    const accepted = [];
-    for (const range of ranges.sort((left, right) => left.start - right.start || right.end - left.end)) {
-        if (range.end <= range.start) continue;
-        if (accepted.some(item => range.start < item.end && item.start < range.end)) continue;
-        accepted.push(range);
-    }
-    return accepted;
+function normalizePrivatePlaceholder(value) {
+    const raw = String(value || '').trim();
+    const full = raw.match(new RegExp(String.raw`\[\[(${PRIVATE_PLACEHOLDER_PATTERN})\]\]`));
+    if (full) return `[[${full[1]}]]`;
+    const inner = raw.match(new RegExp(PRIVATE_PLACEHOLDER_PATTERN));
+    return inner ? `[[${inner[0]}]]` : '';
 }
 
-class WikiRevealPreviewModal extends Modal {
-    constructor(app, { title, summary, text, sensitiveValues, unresolvedPlaceholders }) {
-        super(app);
-        this.title = title;
-        this.summary = summary;
-        this.text = text || '';
-        this.sensitiveValues = Array.isArray(sensitiveValues) ? sensitiveValues : [];
-        this.unresolvedPlaceholders = Array.isArray(unresolvedPlaceholders) ? unresolvedPlaceholders : [];
-        this.previewEl = null;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        this.modalEl.style.width = 'min(1100px, 92vw)';
-        this.modalEl.style.maxWidth = '1100px';
-
-        contentEl.createEl('h3', { text: this.title });
-        if (this.summary) {
-            contentEl.createEl('p', {
-                text: this.summary,
-                cls: 'setting-item-description',
-            });
-        }
-
-        const toolbar = contentEl.createDiv();
-        toolbar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0;';
-
-        let statsText = `${this.sensitiveValues.length} sensitive value${this.sensitiveValues.length === 1 ? '' : 's'} highlighted`;
-        const stats = toolbar.createEl('div', {
-            text: statsText,
-            cls: 'setting-item-description',
+function buildRevealEntityMap(sensitiveValues = [], unresolvedPlaceholders = []) {
+    const entities = new Map();
+    for (const item of sensitiveValues || []) {
+        const placeholder = normalizePrivatePlaceholder(item?.placeholder);
+        if (!placeholder || typeof item?.text !== 'string') continue;
+        entities.set(placeholder, {
+            kind: 'sensitive',
+            placeholder,
+            text: item.text,
+            entityType: item.entityType || 'Sensitive',
         });
-        if (this.unresolvedPlaceholders.length) {
-            statsText = `${statsText} - ${this.unresolvedPlaceholders.length} unresolved placeholder${this.unresolvedPlaceholders.length === 1 ? '' : 's'}`;
-            stats.setText(statsText);
-        }
-
-        const actions = toolbar.createDiv();
-        actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;';
-
-        const markButton = actions.createEl('button', { text: 'Mark Selection Sensitive' });
-        markButton.addEventListener('click', () => this.markSelectionSensitivePrototype());
-
-        const copyButton = actions.createEl('button', { text: 'Copy Preview' });
-        copyButton.addEventListener('click', async () => {
-            try {
-                await navigator.clipboard.writeText(this.text);
-                new Notice('Reveal preview copied.', 4000);
-            } catch {
-                new Notice('Copy failed.', 6000);
-            }
+    }
+    for (const placeholderValue of unresolvedPlaceholders || []) {
+        const placeholder = normalizePrivatePlaceholder(placeholderValue);
+        if (!placeholder || entities.has(placeholder)) continue;
+        entities.set(placeholder, {
+            kind: 'unresolved',
+            placeholder,
+            text: placeholder,
+            entityType: 'Unresolved placeholder',
         });
-
-        this.previewEl = contentEl.createDiv();
-        this.previewEl.tabIndex = 0;
-        this.previewEl.style.cssText = [
-            'max-height:min(70vh, 760px)',
-            'overflow:auto',
-            'background:var(--background-primary)',
-            'border:1px solid var(--background-modifier-border)',
-            'border-radius:8px',
-            'padding:16px',
-            'font-family:var(--font-monospace)',
-            'font-size:13px',
-            'line-height:1.55',
-            'white-space:pre-wrap',
-            'word-break:break-word',
-            'user-select:text',
-        ].join(';');
-        this.previewEl.addEventListener('contextmenu', event => this.openSelectionMenu(event));
-        this.renderPreview();
     }
-
-    renderPreview() {
-        this.previewEl.empty();
-        const ranges = collectRevealHighlightRanges(this.text, this.sensitiveValues, this.unresolvedPlaceholders);
-        let cursor = 0;
-        for (const range of ranges) {
-            if (range.start > cursor) {
-                this.previewEl.appendText(this.text.slice(cursor, range.start));
-            }
-            const mark = this.previewEl.createEl('mark');
-            mark.setText(this.text.slice(range.start, range.end));
-            mark.title = range.label;
-            mark.style.cssText = range.kind === 'unresolved'
-                ? 'background:rgba(255, 193, 7, 0.28);color:inherit;border-bottom:2px solid var(--text-warning);padding:0 2px;border-radius:3px;'
-                : 'background:rgba(214, 90, 90, 0.22);color:inherit;border-bottom:2px solid var(--text-accent);padding:0 2px;border-radius:3px;';
-            cursor = range.end;
-        }
-        if (cursor < this.text.length) {
-            this.previewEl.appendText(this.text.slice(cursor));
-        }
-    }
-
-    selectedPreviewText() {
-        const selection = window.getSelection();
-        if (!selection || selection.rangeCount === 0 || !this.previewEl) return '';
-        const range = selection.getRangeAt(0);
-        if (!this.previewEl.contains(range.commonAncestorContainer)) return '';
-        return selection.toString().trim();
-    }
-
-    markSelectionSensitivePrototype() {
-        const selected = this.selectedPreviewText();
-        if (!selected) {
-            new Notice('Select text in the preview first.', 5000);
-            return;
-        }
-        new Notice('Prototype only: custom privacy terms are not persisted yet.', 7000);
-        console.log('[Wiki Sync] Selected text for future privacy term:', selected);
-    }
-
-    openSelectionMenu(event) {
-        const selected = this.selectedPreviewText();
-        if (!selected) return;
-        event.preventDefault();
-        const menu = new Menu();
-        menu.addItem(item => item
-            .setTitle('Mark selection sensitive')
-            .setIcon('eye-off')
-            .onClick(() => this.markSelectionSensitivePrototype()));
-        menu.showAtMouseEvent(event);
-    }
-
-    onClose() {
-        this.contentEl.empty();
-    }
+    return entities;
 }
 
 class WikiHistoryModal extends Modal {
@@ -2885,12 +2765,10 @@ function selectedPathOrThrow(selection, kind) {
 }
 
 function buildMarkdownFrontmatter(sourceFile, extension, body) {
-    const converted = new Date().toISOString();
     const normalizedBody = body.startsWith('---\n') ? `\n${body}` : body;
     return [
         '---',
         `source_file: ${JSON.stringify(sourceFile)}`,
-        `converted: ${converted}`,
         `original_format: ${extension.slice(1)}`,
         '---',
         '',
@@ -3658,6 +3536,10 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this._recomputeTimer = null;
         this._privacyHelperStarting = null;
         this._connecting = false;
+        this.revealState = null;
+        this.revealRibbonEl = null;
+        this.revealStatusEl = null;
+        this.revealStatusTextEl = null;
         this.remoteAppCache = null;
         this.privacyHelperProcess = null;
         this.privacyHelperLaunchUrl = '';
@@ -3685,6 +3567,22 @@ module.exports = class WikiSyncPlugin extends Plugin {
             .wiki-sync-status-item--muted {
                 opacity: 0.55;
             }
+            .wiki-sync-reveal-mark {
+                background: rgba(214, 90, 90, 0.22);
+                color: inherit;
+                border-bottom: 2px solid var(--text-accent);
+                border-radius: 3px;
+                padding: 0 2px;
+                cursor: context-menu;
+            }
+            .wiki-sync-reveal-mark--unresolved {
+                background: rgba(255, 193, 7, 0.28);
+                border-bottom-color: var(--text-warning);
+            }
+            .wiki-sync-reveal-ribbon.is-active {
+                color: var(--text-accent);
+                background: var(--background-modifier-hover);
+            }
         `;
         document.head.appendChild(this._style);
 
@@ -3693,12 +3591,34 @@ module.exports = class WikiSyncPlugin extends Plugin {
         document.head.appendChild(this._highlightStyle);
         this.updateHighlight();
 
+        this.revealRibbonEl = this.addRibbonIcon('eye', 'Toggle raw reveal in reading mode', () => {
+            void this.revealSensitiveValuesForActiveFile();
+        });
+        this.revealRibbonEl.classList.add('wiki-sync-reveal-ribbon');
+
+        this.revealStatusEl = this.addStatusBarItem();
+        this.revealStatusEl.classList.add('wiki-sync-status-item', 'wiki-sync-reveal-status');
+        this.revealStatusEl.style.cssText = 'display:none;cursor:pointer;align-items:center;gap:6px;padding:2px 6px;border-radius:6px;';
+        const revealStatusIcon = this.revealStatusEl.createEl('span');
+        setIcon(revealStatusIcon, 'eye');
+        this.revealStatusTextEl = this.revealStatusEl.createEl('span');
+        this.revealStatusEl.addEventListener('click', () => this.clearRevealOverlay({ notify: true }));
+
         fs.mkdirSync(this.syncDir(), { recursive: true });
         await this.refreshLocalPath(this.settings.syncSubdir);
 
         this.registerSyncFolderListeners();
         this.registerCommands();
+        this.registerMarkdownPostProcessor((el, context) => this.applyRevealOverlay(el, context));
         this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => this.handleFileMenu(menu, file)));
+        this.registerEvent(this.app.workspace.on('file-open', file => {
+            if (this.revealState && (!file || file.path !== this.revealState.filePath)) {
+                this.clearRevealOverlay({ notify: false });
+            } else {
+                this.updateRevealIndicators();
+            }
+        }));
+        this.updateRevealIndicators();
         setupTemplateNewPOC(this);
         void this.startPrivacyHelper();
         this.recomputeState();
@@ -3713,6 +3633,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this.stopPrivacyHelper();
         if (this._style) this._style.remove();
         if (this._highlightStyle) this._highlightStyle.remove();
+        if (this.revealStatusEl) this.revealStatusEl.remove();
         if (this.connectStatusBarController) this.connectStatusBarController.dispose();
         if (this.statusBarController) this.statusBarController.dispose();
     }
@@ -3725,7 +3646,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
         this.addCommand({ id: 'wiki-pull', name: 'Pull wiki changes', callback: () => this.doPull() });
         this.addCommand({ id: 'wiki-push', name: 'Push wiki changes', callback: () => this.doPush() });
         this.addCommand({ id: 'wiki-sync', name: 'Sync wiki', callback: () => this.doSync() });
-        this.addCommand({ id: 'wiki-reveal-sensitive-values', name: 'Reveal sensitive values', callback: () => this.revealSensitiveValuesForActiveFile() });
+        this.addCommand({ id: 'wiki-reveal-sensitive-values', name: 'Toggle raw reveal in reading mode', callback: () => this.revealSensitiveValuesForActiveFile() });
         this.addCommand({ id: 'wiki-history', name: 'View wiki file history', callback: () => {
             const file = this.app.workspace.getActiveFile();
             if (!file) {
@@ -3763,7 +3684,7 @@ module.exports = class WikiSyncPlugin extends Plugin {
                 .setIcon('history')
                 .onClick(() => new WikiHistoryModal(this.app, this, file).open()));
             menu.addItem(item => item
-                .setTitle('Reveal sensitive values')
+                .setTitle(this.revealState?.filePath === file.path ? 'Hide raw reveal' : 'Reveal sensitive values')
                 .setIcon('eye')
                 .onClick(() => void this.revealSensitiveValuesForActiveFile(file)));
         }
@@ -4179,6 +4100,267 @@ module.exports = class WikiSyncPlugin extends Plugin {
         }).open();
     }
 
+    activeRevealFilePath() {
+        return this.revealState?.filePath || '';
+    }
+
+    buildRevealState(file, syncRel, sanitizedText, revealed) {
+        const sensitiveValues = Array.isArray(revealed.sensitiveValues)
+            ? revealed.sensitiveValues
+            : [];
+        const unresolvedPlaceholders = Array.isArray(revealed.unresolvedPlaceholders)
+            ? revealed.unresolvedPlaceholders
+            : [];
+        const appName = importedAppName(this, syncRel);
+        return {
+            filePath: file.path,
+            syncRel,
+            appName,
+            sanitizedText,
+            text: revealed.text,
+            source: revealed.source || 'placeholderMap',
+            sensitiveValues,
+            unresolvedPlaceholders,
+            entityByPlaceholder: buildRevealEntityMap(sensitiveValues, unresolvedPlaceholders),
+        };
+    }
+
+    updateRevealIndicators() {
+        const active = !!this.revealState;
+        if (this.revealRibbonEl) {
+            this.revealRibbonEl.classList.toggle('is-active', active);
+            this.revealRibbonEl.setAttribute('aria-label', active ? 'Hide raw reveal' : 'Toggle raw reveal in reading mode');
+        }
+        if (this.revealStatusEl) {
+            this.revealStatusEl.style.display = active ? 'flex' : 'none';
+        }
+        if (this.revealStatusTextEl && active) {
+            this.revealStatusTextEl.setText(` Raw reveal: ${path.basename(this.revealState.filePath)}`);
+        }
+    }
+
+    refreshRevealViews(filePath) {
+        for (const leaf of this.app.workspace.getLeavesOfType?.('markdown') || []) {
+            const view = leaf.view;
+            if (view?.file?.path !== filePath) continue;
+            if (view.previewMode?.rerender) {
+                view.previewMode.rerender(true);
+            } else if (view.currentMode?.rerender) {
+                view.currentMode.rerender(true);
+            } else if (leaf.rebuildView) {
+                leaf.rebuildView();
+            }
+        }
+    }
+
+    clearRevealOverlay({ notify = false } = {}) {
+        const oldPath = this.revealState?.filePath || '';
+        this.revealState = null;
+        this.updateRevealIndicators();
+        if (oldPath) this.refreshRevealViews(oldPath);
+        if (notify) new Notice('Raw reveal hidden.', 4000);
+    }
+
+    revealEntityForToken(token) {
+        const placeholder = normalizePrivatePlaceholder(token);
+        return placeholder && this.revealState?.entityByPlaceholder
+            ? this.revealState.entityByPlaceholder.get(placeholder)
+            : null;
+    }
+
+    createRevealMark(entity) {
+        const mark = document.createElement('mark');
+        mark.classList.add('wiki-sync-reveal-mark');
+        if (entity.kind === 'unresolved') mark.classList.add('wiki-sync-reveal-mark--unresolved');
+        mark.textContent = entity.text;
+        mark.title = entity.entityType || 'Sensitive';
+        mark.dataset.placeholder = entity.placeholder || '';
+        mark.dataset.rawValue = entity.kind === 'sensitive' ? entity.text : '';
+        mark.dataset.entityType = entity.entityType || 'PRIVATE';
+        return mark;
+    }
+
+    replaceRevealAnchors(rootEl) {
+        for (const anchor of Array.from(rootEl.querySelectorAll('a.internal-link'))) {
+            const candidates = [
+                anchor.getAttribute('data-href'),
+                anchor.getAttribute('href'),
+                anchor.textContent,
+            ];
+            const entity = candidates.map(value => this.revealEntityForToken(value)).find(Boolean);
+            if (!entity) continue;
+            anchor.replaceWith(this.createRevealMark(entity));
+        }
+    }
+
+    replaceRevealTextNodes(rootEl) {
+        const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
+            acceptNode: node => {
+                if (!node.nodeValue || !PRIVATE_PLACEHOLDER_TEST_RE.test(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+                if (node.parentElement?.closest('.wiki-sync-reveal-mark')) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            },
+        });
+
+        const nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+
+        for (const node of nodes) {
+            const text = node.nodeValue || '';
+            const fragment = document.createDocumentFragment();
+            const tokenRe = new RegExp(PRIVATE_PLACEHOLDER_TOKEN_RE.source, 'g');
+            let cursor = 0;
+            let changed = false;
+            for (const match of text.matchAll(tokenRe)) {
+                const entity = this.revealEntityForToken(match[0]);
+                if (!entity) continue;
+                if (match.index > cursor) fragment.appendChild(document.createTextNode(text.slice(cursor, match.index)));
+                fragment.appendChild(this.createRevealMark(entity));
+                cursor = match.index + match[0].length;
+                changed = true;
+            }
+            if (!changed) continue;
+            if (cursor < text.length) fragment.appendChild(document.createTextNode(text.slice(cursor)));
+            node.replaceWith(fragment);
+        }
+    }
+
+    selectedRevealText(rootEl) {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0) return '';
+        const range = selection.getRangeAt(0);
+        if (!rootEl.contains(range.commonAncestorContainer)) return '';
+        return selection.toString().trim();
+    }
+
+    openRevealContextMenu(event, rootEl) {
+        if (!this.revealState) return;
+        const target = event.target?.nodeType === 1 ? event.target : event.target?.parentElement;
+        const mark = target?.closest?.('.wiki-sync-reveal-mark');
+        const selected = this.selectedRevealText(rootEl);
+        if (!mark && !selected) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        const menu = new Menu();
+        if (selected) {
+            menu.addItem(item => item
+                .setTitle('Mark selection sensitive')
+                .setIcon('eye-off')
+                .onClick(() => void this.applyPrivacyTermFromReveal({
+                    action: 'private',
+                    entityType: 'PRIVATE',
+                    term: selected,
+                })));
+        }
+
+        const rawValue = mark?.dataset?.rawValue || '';
+        if (rawValue) {
+            if (selected) menu.addSeparator();
+            menu.addItem(item => item
+                .setTitle('Do not sanitize this value')
+                .setIcon('eye')
+                .onClick(() => void this.applyPrivacyTermFromReveal({
+                    action: 'allow',
+                    term: rawValue,
+                })));
+        }
+        menu.showAtMouseEvent(event);
+    }
+
+    applyRevealOverlay(rootEl, context) {
+        if (!this.revealState || context.sourcePath !== this.revealState.filePath) return;
+        rootEl.classList.add('wiki-sync-reveal-root');
+        this.replaceRevealAnchors(rootEl);
+        this.replaceRevealTextNodes(rootEl);
+        rootEl.addEventListener('contextmenu', event => this.openRevealContextMenu(event, rootEl));
+    }
+
+    async ensureRevealHelper() {
+        if (!this.settings.privacyHelperEnabled) {
+            throw new Error('Enable the privacy helper to reveal sensitive values.');
+        }
+        if (this.settings.privacyHelperAutoStart) {
+            await this.ensureConnected();
+            const started = await this.startPrivacyHelper({ showNotice: false, requireDatabase: true });
+            if (!started) throw new Error('Wiki helper is not running with database access.');
+        }
+    }
+
+    async loadRevealStateForFile(file, { preferRawSource = true, sanitizedText = null } = {}) {
+        const syncRel = this.syncRelativePath(file.path);
+        if (syncRel === null) throw new Error('Active file is not inside the wiki sync folder');
+        const resolvedSanitizedText = typeof sanitizedText === 'string'
+            ? sanitizedText
+            : await this.app.vault.cachedRead(file);
+        const appName = importedAppName(this, syncRel);
+        const revealed = await this.wikiRagClient.revealText({
+            appName,
+            path: syncRel,
+            sanitizedText: resolvedSanitizedText,
+            preferRawSource,
+        });
+        if (!revealed || typeof revealed.text !== 'string') {
+            throw new Error('Wiki helper did not return revealed text.');
+        }
+        return this.buildRevealState(file, syncRel, resolvedSanitizedText, revealed);
+    }
+
+    async rewriteCurrentRevealFromRaw(successMessage) {
+        const state = this.revealState;
+        if (!state) throw new Error('Raw reveal is not active.');
+        const file = this.app.vault.getAbstractFileByPath(state.filePath);
+        if (!file || file.children !== undefined) throw new Error('The revealed file is no longer available.');
+
+        const sanitized = await this.wikiRagClient.sanitizeNote({
+            appName: state.appName,
+            path: state.syncRel,
+            rawMarkdown: state.text,
+        });
+        if (!sanitized || typeof sanitized.sanitizedMarkdown !== 'string') {
+            throw new Error('Wiki helper did not return sanitized Markdown.');
+        }
+
+        const rawContentHash = typeof sanitized.rawContentHash === 'string'
+            ? sanitized.rawContentHash
+            : sha256Buffer(Buffer.from(state.text, 'utf8'));
+        await this.app.vault.modify(file, sanitized.sanitizedMarkdown);
+        await this.wikiRagClient.indexNote({
+            appName: state.appName,
+            path: state.syncRel,
+            sanitizedMarkdown: sanitized.sanitizedMarkdown,
+            rawContentHash,
+        });
+        this.revealState = await this.loadRevealStateForFile(file, {
+            preferRawSource: false,
+            sanitizedText: sanitized.sanitizedMarkdown,
+        });
+        this.updateRevealIndicators();
+        this.refreshRevealViews(state.filePath);
+        new Notice(successMessage, 5000);
+    }
+
+    async applyPrivacyTermFromReveal({ action, term, entityType = 'PRIVATE' }) {
+        const cleanTerm = String(term || '').trim();
+        if (!cleanTerm) {
+            new Notice('Select a value first.', 5000);
+            return;
+        }
+
+        try {
+            await this.ensureRevealHelper();
+            await this.wikiRagClient.privacyTerm({ action, term: cleanTerm, entityType });
+            await this.rewriteCurrentRevealFromRaw(
+                action === 'allow'
+                    ? 'Value added to the sanitizer allowlist.'
+                    : 'Selection added to sanitizer private terms.',
+            );
+        } catch (error) {
+            new Notice(`Sanitizer update failed: ${error.message}`, 8000);
+        }
+    }
+
     async revealSensitiveValuesForActiveFile(fileOverride = null) {
         const file = fileOverride || this.app.workspace.getActiveFile();
         if (!file) {
@@ -4193,6 +4375,10 @@ module.exports = class WikiSyncPlugin extends Plugin {
             new Notice('Enable the privacy helper to reveal sensitive values.', 7000);
             return;
         }
+        if (this.activeRevealFilePath() === file.path) {
+            this.clearRevealOverlay({ notify: true });
+            return;
+        }
 
         const syncRel = this.syncRelativePath(file.path);
         if (syncRel === null) {
@@ -4200,54 +4386,20 @@ module.exports = class WikiSyncPlugin extends Plugin {
             return;
         }
 
-        let sanitizedText = '';
         try {
-            if (this.settings.privacyHelperAutoStart) {
-                await this.ensureConnected();
-                const started = await this.startPrivacyHelper({ showNotice: false, requireDatabase: true });
-                if (!started) throw new Error('Wiki helper is not running with database access.');
+            await this.ensureRevealHelper();
+            this.revealState = await this.loadRevealStateForFile(file);
+            this.updateRevealIndicators();
+            this.refreshRevealViews(file.path);
+            const unresolvedCount = this.revealState.unresolvedPlaceholders.length;
+            const sensitiveCount = this.revealState.sensitiveValues.length;
+            if (unresolvedCount) {
+                console.warn('[Wiki Sync] Unresolved placeholders during reveal:', this.revealState.unresolvedPlaceholders);
             }
-
-            sanitizedText = await this.app.vault.cachedRead(file);
-            const appName = importedAppName(this, syncRel);
-            const revealed = await this.wikiRagClient.revealText({
-                appName,
-                path: syncRel,
-                sanitizedText,
-            });
-            if (!revealed || typeof revealed.text !== 'string') {
-                throw new Error('Wiki helper did not return revealed text.');
-            }
-
-            const unresolvedPlaceholders = Array.isArray(revealed.unresolvedPlaceholders)
-                ? revealed.unresolvedPlaceholders
-                : [];
-            const sensitiveValues = Array.isArray(revealed.sensitiveValues)
-                ? revealed.sensitiveValues
-                : [];
-            const summary = [
-                revealed.text === sanitizedText
-                    ? 'No placeholder substitutions were needed.'
-                    : 'Read-only revealed preview. The vault file was not modified.',
-                sensitiveValues.length
-                    ? `${sensitiveValues.length} sensitive value${sensitiveValues.length === 1 ? '' : 's'} highlighted.`
-                    : 'No sensitive values were highlighted.',
-                unresolvedPlaceholders.length
-                    ? `${unresolvedPlaceholders.length} placeholder(s) could not be resolved and remain in the preview.`
-                    : 'The vault file was not modified.',
-            ].join(' ');
-
-            new WikiRevealPreviewModal(this.app, {
-                title: `Reveal Sensitive Values - ${path.basename(file.path)}`,
-                summary,
-                text: revealed.text,
-                sensitiveValues,
-                unresolvedPlaceholders,
-            }).open();
-
-            if (unresolvedPlaceholders.length) {
-                console.warn('[Wiki Sync] Unresolved placeholders during reveal:', unresolvedPlaceholders);
-            }
+            new Notice(
+                `Raw reveal enabled in reading mode. ${sensitiveCount} value${sensitiveCount === 1 ? '' : 's'} highlighted${unresolvedCount ? `, ${unresolvedCount} unresolved` : ''}.`,
+                7000,
+            );
         } catch (error) {
             new Notice(`Reveal failed: ${error.message}`, 8000);
         }

@@ -57,6 +57,34 @@ class ValueCipher(Protocol):
         ...
 
 
+class EntityMap(Protocol):
+    def upsert(self, entity_type: str, real_value: str, cipher: ValueCipher) -> EntityRecord:
+        ...
+
+    def resolve(self, placeholder: str) -> EntityRecord | None:
+        ...
+
+
+@dataclass(frozen=True)
+class PrivacyTerm:
+    entity_type: str
+    term: str
+
+
+class PrivacyPolicy(Protocol):
+    def add_private_term(self, entity_type: str, term: str) -> PrivacyTerm:
+        ...
+
+    def add_allowlist_term(self, term: str) -> str:
+        ...
+
+    def private_terms(self) -> tuple[PrivacyTerm, ...]:
+        ...
+
+    def allowlist_terms(self) -> tuple[str, ...]:
+        ...
+
+
 class LocalXorCipher:
     """Small local cipher adapter until a production key strategy is chosen."""
 
@@ -106,6 +134,35 @@ class InMemoryEntityMap:
         return self.by_placeholder.get(placeholder)
 
 
+@dataclass
+class InMemoryPrivacyPolicy:
+    _private_terms: dict[tuple[str, str], PrivacyTerm] = field(default_factory=dict)
+    _allowlist_terms: dict[str, str] = field(default_factory=dict)
+
+    def add_private_term(self, entity_type: str, term: str) -> PrivacyTerm:
+        normalized_term = normalize_policy_term(term)
+        if not normalized_term:
+            raise ValueError("privacy term is empty")
+        normalized_type = normalize_entity_type(entity_type)
+        record = PrivacyTerm(entity_type=normalized_type, term=str(term).strip())
+        self._private_terms[(normalized_type, normalized_term)] = record
+        return record
+
+    def add_allowlist_term(self, term: str) -> str:
+        normalized_term = normalize_policy_term(term)
+        if not normalized_term:
+            raise ValueError("allowlist term is empty")
+        value = str(term).strip()
+        self._allowlist_terms[normalized_term] = value
+        return value
+
+    def private_terms(self) -> tuple[PrivacyTerm, ...]:
+        return tuple(self._private_terms.values())
+
+    def allowlist_terms(self) -> tuple[str, ...]:
+        return tuple(self._allowlist_terms.values())
+
+
 class FakeDetector:
     def __init__(self, terms: dict[str, Iterable[str]]) -> None:
         self.terms = {
@@ -123,13 +180,24 @@ class FakeDetector:
         return _without_overlaps(matches, existing_placeholder_spans(text))
 
 
+class CompositeDetector:
+    def __init__(self, detectors: Iterable[Detector]) -> None:
+        self._detectors = tuple(detectors)
+
+    def detect(self, text: str) -> list[EntityMatch]:
+        matches: list[EntityMatch] = []
+        for detector in self._detectors:
+            matches.extend(detector.detect(text))
+        return _without_overlaps(matches, existing_placeholder_spans(text))
+
+
 class PresidioDetector:
     """NLP-based PII detector backed by Microsoft Presidio + spaCy.
 
     Requires the ``presidio`` optional extras and a downloaded spaCy model::
 
         pip install 'wiki-helper[presidio]'
-        python -m spacy download en_core_web_sm
+        python -m spacy download en_core_web_lg
     """
 
     def __init__(self, analyzer: object, language: str = "en", score_threshold: float = 0.5) -> None:
@@ -142,7 +210,7 @@ class PresidioDetector:
         cls,
         language: str = "en",
         score_threshold: float = 0.5,
-        model: str = "en_core_web_sm",
+        model: str = "en_core_web_lg",
     ) -> "PresidioDetector":
         try:
             from presidio_analyzer import AnalyzerEngine  # type: ignore[import-untyped]
@@ -191,6 +259,10 @@ def normalize_entity_type(entity_type: str) -> str:
     return normalized or "PRIVATE"
 
 
+def normalize_policy_term(term: str) -> str:
+    return re.sub(r"\s+", " ", str(term or "").strip().lower())
+
+
 def real_value_hash(entity_type: str, real_value: str) -> str:
     digest = hashlib.sha256()
     digest.update(normalize_entity_type(entity_type).encode("utf-8"))
@@ -205,12 +277,14 @@ def placeholder_for_hash(entity_type: str, value_hash: str, length: int = 12) ->
 
 def sanitize_text(
     text: str,
-    detector: FakeDetector,
-    entity_map: InMemoryEntityMap,
+    detector: Detector,
+    entity_map: EntityMap,
     cipher: ValueCipher | None = None,
+    allowlist_terms: Iterable[str] = (),
 ) -> SanitizedText:
     active_cipher = cipher or LocalXorCipher()
     matches = _without_overlaps(detector.detect(text), existing_placeholder_spans(text))
+    matches = _without_allowlist(matches, allowlist_terms)
     if not matches:
         return SanitizedText(text=text)
 
@@ -229,7 +303,7 @@ def sanitize_text(
 
 def reveal_text(
     sanitized_text: str,
-    entity_map: InMemoryEntityMap,
+    entity_map: EntityMap,
     cipher: ValueCipher | None = None,
 ) -> RevealResult:
     active_cipher = cipher or LocalXorCipher()
@@ -271,6 +345,13 @@ def _without_overlaps(matches: Iterable[EntityMatch], blocked: Iterable[tuple[in
             continue
         accepted.append(match)
     return accepted
+
+
+def _without_allowlist(matches: Iterable[EntityMatch], allowlist_terms: Iterable[str]) -> list[EntityMatch]:
+    allowlist = {normalize_policy_term(term) for term in allowlist_terms if normalize_policy_term(term)}
+    if not allowlist:
+        return list(matches)
+    return [match for match in matches if normalize_policy_term(match.text) not in allowlist]
 
 
 def _overlaps(left_start: int, left_end: int, right_start: int, right_end: int) -> bool:

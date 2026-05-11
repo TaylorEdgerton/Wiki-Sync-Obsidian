@@ -7,6 +7,9 @@ class SchemaTests(unittest.TestCase):
     def test_schema_contains_expected_tables(self):
         sql = read_bootstrap_schema()
         self.assertIn("wiki_private.entity_map", sql)
+        self.assertIn("wiki_private.privacy_terms", sql)
+        self.assertIn("wiki_private.privacy_allowlist", sql)
+        self.assertIn("wiki_private.raw_documents", sql)
         self.assertIn("wiki_public.sanitized_documents", sql)
         self.assertIn("wiki_public.chunks", sql)
 
@@ -17,4 +20,3 @@ class SchemaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
